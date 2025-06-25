@@ -30,10 +30,7 @@ def is_trusted_ip(ip):
 def restrict_to_trusted_sources():
     if request.method == "POST":
         ip = request.remote_addr
-        if not is_trusted_ip(ip):
-            return abort(403, description="Forbidden: Untrusted IP")
-
-
+        
 def load_orders():
     try:
         with open(ORDERS_FILE, "r") as f:
