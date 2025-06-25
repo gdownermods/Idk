@@ -1,13 +1,37 @@
-from flask import Flask, request
+from flask import Flask, request, abort
 import requests
 import os
 import json
+import ipaddress
 
 app = Flask(__name__)
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 EXPECTED_ADDRESS = os.getenv("EXPECTED_ADDRESS")
 ORDERS_FILE = "orders.json"
+
+# Allowlisted IP ranges for BlockCypher (examples — update if needed)
+TRUSTED_IPS = [
+    ipaddress.ip_network("34.199.80.0/20"),
+    ipaddress.ip_network("54.144.0.0/15"),
+    ipaddress.ip_network("52.4.0.0/14")
+]
+
+
+def is_trusted_ip(ip):
+    try:
+        ip_addr = ipaddress.ip_address(ip)
+        return any(ip_addr in net for net in TRUSTED_IPS)
+    except ValueError:
+        return False
+
+
+@app.before_request
+def restrict_to_trusted_sources():
+    if request.method == "POST":
+        ip = request.remote_addr
+        if not is_trusted_ip(ip):
+            return abort(403, description="Forbidden: Untrusted IP")
 
 
 def load_orders():
@@ -31,11 +55,9 @@ def find_matching_order(amount):
 def ltc_webhook():
     data = request.json
 
-    # Basic verification of incoming data
     if not data or 'outputs' not in data or 'hash' not in data or 'confirmations' not in data:
         return "Invalid or incomplete data", 400
 
-    # Only allow confirmed transactions (blockchain verification)
     if data['confirmations'] < 1:
         return "Ignored: unconfirmed transaction", 200
 
