@@ -6,6 +6,7 @@ import os
 app = Flask(__name__)
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+EXPECTED_ADDRESS = "ltc1qd2jtyscqruktvm7tctznsdy3verp26a2uzuv26"
 
 @app.route('/ltc-webhook', methods=['POST'])
 def ltc_webhook():
