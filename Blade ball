@@ -1,193 +1,2162 @@
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+import json
 import asyncio
-import random
+import uuid
+import os
 import time
+from datetime import datetime, timedelta
+import random
 import aiohttp
-from typing import List, Dict
-from threading import Thread
-from message_manager import MessageManager
-from auth_system import Authorize, GuildJoiner
+from concurrent.futures import ThreadPoolExecutor
 import requests
 
-class AutoTrader:
-    def __init__(self, config: Dict):
-        self.config = config
-        self.message_manager = MessageManager()
-        self.running = False
-        self.active_tasks = {}
+# Import our modules
+from auth_system import Authorize, GuildJoiner
+from key_manager import KeyManager
+from message_manager import MessageManager
+
+# Check if modules exist before importing
+try:
+    from auto_trader import AutoTrader
+    AUTO_TRADER_AVAILABLE = True
+except ImportError:
+    print("⚠️ AutoTrader module not available")
+    AUTO_TRADER_AVAILABLE = False
+    # Create dummy class
+    class AutoTrader:
+        def __init__(self, config): pass
+        def start_trading(self, *args, **kwargs): print("AutoTrader not available")
+        def stop_trading(self, *args, **kwargs): pass
+
+try:
+    from auto_voucher import AutoVoucher
+    AUTO_VOUCHER_AVAILABLE = True
+except ImportError:
+    print("⚠️ AutoVoucher module not available")
+    AUTO_VOUCHER_AVAILABLE = False
+    class AutoVoucher:
+        def __init__(self, config): pass
+        def start_vouching(self, *args, **kwargs): print("AutoVoucher not available")
+        def stop_vouching(self, *args, **kwargs): pass
+
+try:
+    from vc_manager import VCJoiner
+    VC_JOINER_AVAILABLE = True
+except ImportError:
+    print("⚠️ VCJoiner module not available")
+    VC_JOINER_AVAILABLE = False
+    class VCJoiner:
+        def __init__(self, config): pass
+        def start_vc_joining(self, *args, **kwargs): print("VCJoiner not available")
+        def stop_vc_joining(self, *args, **kwargs): pass
+
+try:
+    from chat_manager import ChatCopier
+    CHAT_COPIER_AVAILABLE = True
+except ImportError:
+    print("⚠️ ChatCopier module not available")
+    CHAT_COPIER_AVAILABLE = False
+    class ChatCopier:
+        def __init__(self, config): pass
+        def start_chat_copying(self, *args, **kwargs): print("ChatCopier not available")
+        def stop_chat_copying(self, *args, **kwargs): pass
+
+# Load config
+with open('config.json') as f:
+    config = json.load(f)
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# Initialize managers
+key_manager = KeyManager()
+message_manager = MessageManager()
+
+# Initialize other managers if available
+if AUTO_TRADER_AVAILABLE:
+    auto_trader = AutoTrader(config)
+else:
+    auto_trader = AutoTrader(config)
+
+if AUTO_VOUCHER_AVAILABLE:
+    auto_voucher = AutoVoucher(config)
+else:
+    auto_voucher = AutoVoucher(config)
+
+if VC_JOINER_AVAILABLE:
+    vc_joiner = VCJoiner(config)
+else:
+    vc_joiner = VCJoiner(config)
+
+if CHAT_COPIER_AVAILABLE:
+    chat_copier = ChatCopier(config)
+else:
+    chat_copier = ChatCopier(config)
+
+# Webhook channel ID
+WEBHOOK_CHANNEL_ID = config.get("webhook_channel_id")
+PRIVATE_LOG_CHANNEL_ID = config.get("log_channel_id")
+ADMIN_ROLE_ID = config.get("admin_role_id")
+CLIENT_ID = config.get("client_id")
+CLIENT_SECRET = config.get("client_secret")
+REDIRECT_URI = config.get("redirect_uri")
+BOT_TOKEN = config.get("bot_token")
+
+# Check if auth system is available
+try:
+    HAS_AUTH_SYSTEM = True
+except:
+    HAS_AUTH_SYSTEM = False
+
+# Token validation functions
+def remove_dead_token(token_line: str):
+    """Remove ONLY permanently dead tokens from tokens.txt"""
+    try:
+        with open('tokens.txt', 'r') as f:
+            lines = f.readlines()
         
-    def load_tokens(self) -> List[str]:
-        """Load trader tokens from file"""
-        try:
-            with open('tokens_trade.txt', 'r') as f:
-                return [line.strip() for line in f if line.strip()]
-        except FileNotFoundError:
-            return []
-    
-    def get_token_session(self, token_line: str):
-        """Create authenticated session for token with shared proxy"""
-        try:
-            # Extract token
-            if ':' in token_line:
-                parts = token_line.split(':')
-                if len(parts) >= 3:
-                    token = parts[2].strip()
-                else:
-                    token = token_line.strip()
+        new_lines = []
+        removed = False
+        for line in lines:
+            if line.strip() == token_line.strip():
+                removed = True
+                continue
+            new_lines.append(line)
+        
+        if removed:
+            with open('tokens.txt', 'w') as f:
+                f.writelines(new_lines)
+            print(f"🗑️ Removed dead token: {token_line[:50]}...")
+                
+    except Exception as e:
+        print(f"❌ Error removing token: {e}")
+
+def validate_token(token_line: str):
+    """Check if token can join and send messages - with proper timeout"""
+    try:
+        # Extract token
+        if ':' in token_line:
+            parts = token_line.split(':')
+            if len(parts) >= 3:
+                token = parts[2].strip()
             else:
                 token = token_line.strip()
-            
-            # Create authorized session WITH PROXY
-            auth = Authorize(
-                self.config["client_id"],
-                self.config["redirect_uri"],
-                self.config["client_secret"],
-                token_line  # Pass the full token line for proxy assignment
+        else:
+            token = token_line.strip()
+        
+        headers = {"Authorization": token}
+        
+        # Check with timeout
+        try:
+            # Shorter timeout for validation
+            user_check = requests.get(
+                "https://discord.com/api/v9/users/@me",
+                headers=headers,
+                timeout=3  # Shorter timeout
             )
             
-            result = auth.authorize()
-            if not result:
-                return None
+            # Definitely dead
+            if user_check.status_code == 401:
+                return "invalid"
             
-            user_id, access_token, refresh_token, discord_token = result
+            # Phone verification required
+            if user_check.status_code == 403:
+                response_text = user_check.text.lower()
+                
+                phone_keywords = [
+                    'phone verification',
+                    'phone verification required',
+                    'phone number',
+                    'phone_required',
+                    'verification_required',
+                ]
+                
+                for keyword in phone_keywords:
+                    if keyword in response_text:
+                        return "phone_locked"
+                
+                if 'account disabled' in response_text:
+                    return "disabled"
+                
+                if 'locked' in response_text:
+                    return "locked"
             
-            # Create session (proxy is already handled by the auth system)
-            session = requests.Session()
+            # If we get here and status is 200, token is valid
+            if user_check.status_code == 200:
+                return "valid"
+                
+            # Other status codes - assume valid but might have issues
+            return "valid"
             
-            return {
-                "token": discord_token,
-                "access_token": access_token,
-                "user_id": user_id,
-                "session": session
-            }
-            
-        except Exception as e:
-            print(f"❌ Failed to auth token: {e}")
-            return None
+        except requests.exceptions.Timeout:
+            return "timeout"
+        except requests.exceptions.ConnectionError:
+            return "connection_error"
+        
+    except Exception as e:
+        print(f"Token validation error: {e}")
+        return "error"
+
+async def join_guild_sync_simple_async(token_line, guild_id):
+    """Async version of join function"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: join_guild_sync_simple(token_line, guild_id))
+
+# Then update all the process_token_file functions to use the async version:
+
+async def process_token_file(key_data, guild_id, msg, token_file):
+    """Generic token processing function - ASYNC"""
+    if not os.path.exists(token_file):
+        embed = msg.embeds[0]
+        embed.description = (
+            f"**Key:** `{key_data['key']}`\n"
+            f"**Goal:** {key_data['tokens']} joins\n"
+            f"**Token File:** {token_file}\n"
+            f"❌ Token file not found!"
+        )
+        await msg.edit(embed=embed)
+        return key_data["tokens"], 0
     
-    async def send_trade_message_with_template(self, session_data: Dict, channel_id: str, key_id: str, key_manager, message: str):
-        """Send a trade message using a specific message"""
+    with open(token_file, 'r') as f:
+        all_tokens = [line.strip() for line in f if line.strip()]
+    
+    needed = key_data["tokens"]
+    
+    if len(all_tokens) < needed:
+        embed = msg.embeds[0]
+        embed.description = (
+            f"**Key:** `{key_data['key']}`\n"
+            f"**Goal:** {needed} joins\n"
+            f"**Available:** {len(all_tokens)} tokens in {token_file}\n"
+            f"❌ Not enough tokens!"
+        )
+        await msg.edit(embed=embed)
+        return needed, 0
+    
+    success = 0
+    token_index = 0
+    batch_size = 3  # Smaller batch size
+    
+    while success < needed and token_index < len(all_tokens):
+        with open(token_file, 'r') as f:
+            current_tokens = [line.strip() for line in f if line.strip()]
+        
+        if token_index >= len(current_tokens):
+            break
+        
+        remaining = needed - success
+        current_batch = min(batch_size, remaining, len(current_tokens) - token_index)
+        batch = current_tokens[token_index:token_index + current_batch]
+        
+        print(f"🔧 {token_file} Batch: {len(batch)} tokens | Success: {success}/{needed}")
+        
+        # Process batch async
+        batch_success = 0
+        tasks = []
+        for token in batch:
+            task = asyncio.create_task(join_guild_sync_simple_async(token, guild_id))
+            tasks.append(task)
+        
+        # Wait for all tasks
         try:
-            headers = {
-                "Authorization": session_data["token"],
-                "Content-Type": "application/json"
-            }
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=30.0
+            )
             
-            payload = {
-                "content": message,
-                "tts": False
-            }
-            
-            url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-            
-            async with aiohttp.ClientSession() as http_session:
-                async with http_session.post(url, json=payload, headers=headers) as response:
-                    if response.status in (200, 201, 204):
-                        print(f"✅ Trade message sent to channel {channel_id}")
-                        key_manager.increment_messages(key_id)
-                        return True
-                    else:
-                        print(f"❌ Failed to send trade message: {response.status}")
-                        return False
-                            
-        except Exception as e:
-            print(f"❌ Error sending trade message: {e}")
-            return False
+            for result in results:
+                if isinstance(result, bool) and result:
+                    batch_success += 1
+                    
+        except asyncio.TimeoutError:
+            print(f"⚠️ Timeout processing batch in {token_file}")
+            continue
+        
+        success += batch_success
+        token_index += current_batch
+        
+        progress_percent = (success / needed) * 100
+        embed = msg.embeds[0]
+        embed.description = (
+            f"**Key:** `{key_data['key']}`\n"
+            f"**Type:** {key_data['type'].capitalize()}\n"
+            f"**Goal:** {needed} joins\n"
+            f"**Progress:** {success}/{needed} ({progress_percent:.0f}%)\n"
+            f"**Status:** Processing {token_file}..."
+        )
+        await msg.edit(embed=embed)
+        
+        await asyncio.sleep(1)
     
-    def start_trading(self, key_id: str, channel_id: str, delay: int, key_manager, category: str = "general"):
-        """Start auto-trading for a key with specified category"""
-        if key_id in self.active_tasks:
-            print(f"⚠️ Trading already running for key {key_id}")
-            return
+    return needed, success
+    
+def join_guild_sync_simple(token_line, guild_id):
+    """Simple join function without complex validation"""
+    try:
+        # Extract token
+        token = token_line.strip()
+        if ':' in token:
+            parts = token.split(':')
+            if len(parts) >= 3:
+                token = parts[2].strip()
         
-        # Update category setting
-        key_manager.update_settings(key_id, {"category": category})
+        if not HAS_AUTH_SYSTEM:
+            return False
         
-        # Get how many tokens this key should use
-        key_data = key_manager.keys_db.get(key_id, {})
-        max_tokens = key_data.get("tokens", 0)
+        # Try to join
+        auth = Authorize(CLIENT_ID, REDIRECT_URI, CLIENT_SECRET, token)
+        result = auth.authorize()
         
-        self.running = True
-        self.active_tasks[key_id] = {
-            "running": True,
-            "task": None,
-            "current_message": None,
-            "message_count": 0,
-            "max_message_repeat": random.randint(10, 30),
-            "category": category
+        if not result:
+            return False
+        
+        user_id, access_token, refresh_token, discord_token = result
+        
+        joiner = GuildJoiner(user_id, access_token, guild_id, BOT_TOKEN)
+        return joiner.join_guild()
+            
+    except Exception as e:
+        print(f"Join error: {e}")
+        return False
+        
+async def process_trader_tokens(key_data, guild_id, msg):
+    """Process trader tokens (join them to server)"""
+    token_file = "tokens_trade.txt"
+    return await process_token_file(key_data, guild_id, msg, token_file)
+
+async def process_voucher_tokens(key_data, guild_id, msg):
+    """Process voucher tokens (join them to server)"""
+    token_file = "tokens_vouch.txt"
+    return await process_token_file(key_data, guild_id, msg, token_file)
+
+async def process_joiner_tokens(key_data, guild_id, msg):
+    """Process joiner tokens (join them to server)"""
+    token_file = "tokens_joiner.txt"
+    return await process_token_file(key_data, guild_id, msg, token_file)
+
+async def process_vc_tokens(key_data, guild_id, msg):
+    """Process VC tokens (join them to server)"""
+    token_file = "tokens_vc.txt"
+    return await process_token_file(key_data, guild_id, msg, token_file)
+
+async def process_copier_tokens(key_data, guild_id, msg):
+    """Process chat copier tokens (join them to server)"""
+    token_file = "tokens_copier.txt"
+    return await process_token_file(key_data, guild_id, msg, token_file)
+
+async def process_token_file(key_data, guild_id, msg, token_file):
+    """Generic token processing function"""
+    if not os.path.exists(token_file):
+        embed = msg.embeds[0]
+        embed.description = (
+            f"**Key:** `{key_data['key']}`\n"
+            f"**Goal:** {key_data['tokens']} joins\n"
+            f"**Token File:** {token_file}\n"
+            f"❌ Token file not found!"
+        )
+        await msg.edit(embed=embed)
+        return key_data["tokens"], 0
+    
+    with open(token_file, 'r') as f:
+        all_tokens = [line.strip() for line in f if line.strip()]
+    
+    needed = key_data["tokens"]
+    
+    if len(all_tokens) < needed:
+        embed = msg.embeds[0]
+        embed.description = (
+            f"**Key:** `{key_data['key']}`\n"
+            f"**Goal:** {needed} joins\n"
+            f"**Available:** {len(all_tokens)} tokens in {token_file}\n"
+            f"❌ Not enough tokens!"
+        )
+        await msg.edit(embed=embed)
+        return needed, 0
+    
+    success = 0
+    token_index = 0
+    batch_size = 5
+    
+    while success < needed and token_index < len(all_tokens):
+        with open(token_file, 'r') as f:
+            current_tokens = [line.strip() for line in f if line.strip()]
+        
+        if token_index >= len(current_tokens):
+            break
+        
+        remaining = needed - success
+        current_batch = min(batch_size, remaining, len(current_tokens) - token_index)
+        batch = current_tokens[token_index:token_index + current_batch]
+        
+        print(f"🔧 {token_file} Batch: {len(batch)} tokens | Success: {success}/{needed}")
+        
+        batch_success = 0
+        with ThreadPoolExecutor(max_workers=current_batch) as executor:
+            futures = [executor.submit(join_guild_sync_simple, token, guild_id) for token in batch]
+            
+            for future in futures:
+                if future.result():
+                    batch_success += 1
+        
+        success += batch_success
+        token_index += current_batch
+        
+        progress_percent = (success / needed) * 100
+        embed = msg.embeds[0]
+        embed.description = (
+            f"**Key:** `{key_data['key']}`\n"
+            f"**Type:** {key_data['type'].capitalize()}\n"
+            f"**Goal:** {needed} joins\n"
+            f"**Progress:** {success}/{needed} ({progress_percent:.0f}%)\n"
+            f"**Status:** Processing {token_file}..."
+        )
+        await msg.edit(embed=embed)
+        
+        await asyncio.sleep(1)
+    
+    return needed, success
+
+@tasks.loop(hours=24)
+async def clean_expired_keys():
+    """Daily task to clean expired keys"""
+    print("🧹 Cleaning expired keys...")
+    key_manager.clean_expired_keys()
+
+@bot.event
+async def on_ready():
+    await tree.sync()
+    clean_expired_keys.start()
+    print(f"✅ Bot ready as {bot.user}")
+
+# Replace the entire count_valid_tokens function with this:
+
+async def validate_token_async(token_line: str):
+    """Async version of token validation"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: validate_token(token_line))
+
+async def count_valid_tokens_async(filename):
+    """Count only valid tokens that can join and chat - ASYNC VERSION"""
+    try:
+        if not os.path.exists(filename):
+            return 0
+        
+        with open(filename, 'r') as f:
+            all_tokens = [line.strip() for line in f if line.strip()]
+        
+        if not all_tokens:
+            return 0
+        
+        # Count valid tokens ASYNC
+        valid_count = 0
+        
+        # Process tokens in smaller batches with timeouts
+        batch_size = 5
+        for i in range(0, len(all_tokens), batch_size):
+            batch = all_tokens[i:i + batch_size]
+            
+            # Create tasks for each token
+            tasks = []
+            for token in batch:
+                task = asyncio.create_task(validate_token_async(token))
+                tasks.append(task)
+            
+            # Wait for all tasks with timeout
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=10.0
+                )
+                
+                for result in results:
+                    if isinstance(result, str) and result == "valid":
+                        valid_count += 1
+                        
+            except asyncio.TimeoutError:
+                print(f"⚠️ Timeout validating tokens in {filename}, skipping batch")
+                continue
+            except Exception as e:
+                print(f"⚠️ Error validating tokens: {e}")
+                continue
+        
+        return valid_count
+        
+    except Exception as e:
+        print(f"❌ Error counting tokens in {filename}: {e}")
+        return 0
+
+# Update ONLY the admin command - keep everything else the same
+
+@tree.command(name="admin", description="Admin panel")
+@app_commands.default_permissions(administrator=True)
+async def admin(interaction: discord.Interaction):
+    """Admin panel - INSTANT LOADING"""
+    await interaction.response.defer(ephemeral=True)
+    
+    embed = discord.Embed(
+        title="🔧 Admin Panel",
+        color=discord.Color.blue()
+    )
+    
+    # Simple token counting - NO VALIDATION
+    def count_all_tokens(filename):
+        try:
+            if os.path.exists(filename):
+                with open(filename, 'r') as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                    return len(lines)
+            return 0
+        except:
+            return 0
+    
+    # Count tokens for all types - INSTANT
+    token_files = {
+        "👥 Joiner": "tokens_joiner.txt",
+        "💱 Trader": "tokens_trade.txt", 
+        "⭐ Voucher": "tokens_vouch.txt",
+        "🎤 VC": "tokens_vc.txt",
+        "💬 Copier": "tokens_copier.txt"
+    }
+    
+    token_stats = []
+    total_tokens = 0
+    
+    for name, file in token_files.items():
+        count = count_all_tokens(file)
+        total_tokens += count
+        token_stats.append(f"{name}: `{count}`")
+    
+    embed.add_field(
+        name="📊 Token Counts",
+        value="\n".join(token_stats),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📈 Total Tokens",
+        value=f"**All Token Files:** `{total_tokens}` tokens",
+        inline=False
+    )
+    
+    # Key stats (this is fast)
+    stats = key_manager.get_key_stats()
+    embed.add_field(
+        name="🔑 Key Statistics",
+        value=(
+            f"**Total Keys:** `{stats['total']}`\n"
+            f"**Active:** Joiner `{stats['joiner']}` | Trader `{stats['trader']}` | Voucher `{stats['voucher']}`\n"
+            f"**Status:** Used `{stats['used']}` | Running `{stats['running']}`"
+        ),
+        inline=False
+    )
+    
+    embed.set_footer(text="Use 'Clean Dead Tokens' to validate and remove invalid tokens")
+    
+    view = AdminPanelView()
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+# Also update the clean_token_file function to be async:
+async def clean_token_file_async(file_path: str) -> str:
+    """Clean DEAD tokens from a specific file - ASYNC VERSION"""
+    if not os.path.exists(file_path):
+        return "File not found"
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        all_tokens = [line.strip() for line in f if line.strip()]
+    
+    if not all_tokens:
+        return "No tokens"
+    
+    alive_tokens = []
+    dead_count = 0
+    phone_locked_count = 0
+    
+    # Process in smaller batches async
+    batch_size = 10
+    total_batches = (len(all_tokens) + batch_size - 1) // batch_size
+    
+    for batch_num in range(total_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, len(all_tokens))
+        batch = all_tokens[start_idx:end_idx]
+        
+        # Create tasks for batch
+        tasks = []
+        for token in batch:
+            task = asyncio.create_task(validate_token_async(token))
+            tasks.append(task)
+        
+        try:
+            # Wait for batch with timeout
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=15.0
+            )
+            
+            for i, result in enumerate(results):
+                token = batch[i]
+                if isinstance(result, str):
+                    token_status = result
+                else:
+                    token_status = "error"
+                
+                if token_status in ["valid", "error", "restricted", "timeout"]:
+                    alive_tokens.append(token)
+                else:
+                    dead_count += 1
+                    if token_status == "phone_locked":
+                        phone_locked_count += 1
+                    print(f"❌ Removing {token_status} token: {token[:30]}...")
+                    
+        except asyncio.TimeoutError:
+            print(f"⚠️ Timeout cleaning batch {batch_num + 1}, skipping")
+            # Keep tokens in timeout case
+            alive_tokens.extend(batch)
+            continue
+        except Exception as e:
+            print(f"⚠️ Error cleaning batch: {e}")
+            alive_tokens.extend(batch)
+            continue
+        
+        # Small delay between batches
+        await asyncio.sleep(0.5)
+    
+    # Save alive tokens back
+    with open(file_path, 'w', encoding='utf-8') as f:
+        for token in alive_tokens:
+            f.write(token + '\n')
+    
+    # Save dead tokens to backup
+    if dead_count > 0:
+        backup_file = f"{file_path}_dead_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        dead_tokens = [t for t in all_tokens if t not in alive_tokens]
+        
+        with open(backup_file, 'w', encoding='utf-8') as f:
+            for token in dead_tokens:
+                f.write(token + '\n')
+    
+    return f"{len(alive_tokens)} alive, {dead_count} removed ({phone_locked_count} phone locked)"
+
+# Update the clean_tokens button callback:
+@discord.ui.button(label="Clean Dead Tokens", style=discord.ButtonStyle.danger, emoji="🧹")
+async def clean_tokens(self, interaction: discord.Interaction, button: discord.ui.Button):
+    """Clean dead tokens from all files - ASYNC"""
+    await interaction.response.defer(ephemeral=True)
+    
+    embed = discord.Embed(
+        title="🧹 Cleaning All Token Files...",
+        description="Checking all token files for dead tokens...",
+        color=discord.Color.orange()
+    )
+    msg = await interaction.followup.send(embed=embed, ephemeral=True)
+    
+    # Clean all token files ASYNC
+    results = []
+    for token_file in ['tokens_joiner.txt', 'tokens_trade.txt', 'tokens_vouch.txt', 'tokens_vc.txt', 'tokens_copier.txt']:
+        if os.path.exists(token_file):
+            result = await clean_token_file_async(token_file)  # ASYNC CALL
+            results.append(f"**{token_file}:** {result}")
+    
+    result_embed = discord.Embed(
+        title="✅ Cleanup Complete",
+        description="\n".join(results),
+        color=discord.Color.green()
+    )
+    
+    await msg.edit(embed=result_embed)
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+    
+    @discord.ui.button(label="Generate Key", style=discord.ButtonStyle.primary, emoji="🔑")
+    async def generate_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="🔑 Generate Key",
+            description="Select the type of key to generate:",
+            color=discord.Color.blue()
+        )
+        
+        view = KeyTypeView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    
+    @discord.ui.button(label="Add Tokens", style=discord.ButtonStyle.secondary, emoji="➕")
+    async def add_tokens(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="➕ Add Tokens",
+            description="Select where to add tokens:",
+            color=discord.Color.blue()
+        )
+        
+        view = TokenTypeView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    
+    @discord.ui.button(label="Clean Dead Tokens", style=discord.ButtonStyle.danger, emoji="🧹")
+    async def clean_tokens(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        embed = discord.Embed(
+            title="🧹 Cleaning All Token Files...",
+            description="Checking all token files for dead tokens...",
+            color=discord.Color.orange()
+        )
+        msg = await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        results = []
+        for token_file in ['tokens_joiner.txt', 'tokens_trade.txt', 'tokens_vouch.txt', 'tokens_vc.txt', 'tokens_copier.txt']:
+            if os.path.exists(token_file):
+                result = await clean_token_file(token_file)
+                results.append(f"**{token_file}:** {result}")
+        
+        result_embed = discord.Embed(
+            title="✅ Cleanup Complete",
+            description="\n".join(results),
+            color=discord.Color.green()
+        )
+        
+        await msg.edit(embed=result_embed)
+
+async def clean_token_file(file_path: str) -> str:
+    """Clean DEAD tokens from a specific file"""
+    if not os.path.exists(file_path):
+        return "File not found"
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        all_tokens = [line.strip() for line in f if line.strip()]
+    
+    if not all_tokens:
+        return "No tokens"
+    
+    alive_tokens = []
+    dead_count = 0
+    phone_locked_count = 0
+    
+    # Process in batches
+    batch_size = 20
+    total_batches = (len(all_tokens) + batch_size - 1) // batch_size
+    
+    for batch_num in range(total_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, len(all_tokens))
+        batch = all_tokens[start_idx:end_idx]
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(validate_token, token) for token in batch]
+            
+            for i, future in enumerate(futures):
+                token_status = future.result()
+                token = batch[i]
+                
+                if token_status in ["valid", "error", "restricted", "timeout"]:
+                    alive_tokens.append(token)
+                else:
+                    dead_count += 1
+                    if token_status == "phone_locked":
+                        phone_locked_count += 1
+    
+    # Save alive tokens back
+    with open(file_path, 'w', encoding='utf-8') as f:
+        for token in alive_tokens:
+            f.write(token + '\n')
+    
+    return f"{len(alive_tokens)} alive, {dead_count} removed ({phone_locked_count} phone locked)"
+
+class KeyTypeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+    
+    @discord.ui.button(label="👥 Joiner Key", style=discord.ButtonStyle.green)
+    async def joiner_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = GenerateKeyModal("joiner")
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="💱 Trader Key", style=discord.ButtonStyle.blurple)
+    async def trader_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = GenerateKeyModal("trader")
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="⭐ Voucher Key", style=discord.ButtonStyle.gray)
+    async def voucher_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = GenerateKeyModal("voucher")
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="🎤 VC Key", style=discord.ButtonStyle.green)
+    async def vc_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = GenerateKeyModal("vc")
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="💬 Chat Copier Key", style=discord.ButtonStyle.blurple)
+    async def copier_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = GenerateKeyModal("copier")
+        await interaction.response.send_modal(modal)
+
+class TokenTypeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+    
+    @discord.ui.button(label="👥 Joiner Tokens", style=discord.ButtonStyle.green, emoji="👥")
+    async def joiner_tokens(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = AddTokensModal("joiner")
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="💱 Trader Tokens", style=discord.ButtonStyle.blurple, emoji="💱")
+    async def trader_tokens(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = AddTokensModal("trader")
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="⭐ Voucher Tokens", style=discord.ButtonStyle.gray, emoji="⭐")
+    async def voucher_tokens(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = AddTokensModal("voucher")
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="🎤 VC Tokens", style=discord.ButtonStyle.green, emoji="🎤")
+    async def vc_tokens(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = AddTokensModal("vc")
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="💬 Chat Copier Tokens", style=discord.ButtonStyle.blurple, emoji="💬")
+    async def copier_tokens(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = AddTokensModal("copier")
+        await interaction.response.send_modal(modal)
+        
+class AddTokensModal(discord.ui.Modal, title="Add Tokens"):
+    def __init__(self, token_type: str):
+        super().__init__()
+        self.token_type = token_type
+        
+        token_files = {
+            "joiner": "tokens_joiner.txt",
+            "trader": "tokens_trade.txt",
+            "voucher": "tokens_vouch.txt",
+            "vc": "tokens_vc.txt",
+            "copier": "tokens_copier.txt"
         }
         
-        async def trading_loop_with_category():
-            tokens = self.load_tokens()
-            if not tokens:
-                print("❌ No trader tokens available")
-                return
-            
-            usable_tokens = tokens[:max_tokens]
-            print(f"✅ Using {len(usable_tokens)}/{max_tokens} tokens for key {key_id} with category: {category}")
-            
-            if not usable_tokens:
-                print("❌ No usable tokens")
-                return
-            
-            # Authorize only the tokens we'll use
-            sessions = []
-            for token_line in usable_tokens:
-                session = self.get_token_session(token_line)
-                if session:
-                    sessions.append(session)
-            
-            if not sessions:
-                print("❌ No valid trader tokens")
-                return
-            
-            print(f"✅ Starting auto-trader with {len(sessions)} tokens, category: {category}")
-            
-            token_index = 0
-            messages_sent = 0
-            
-            # Run continuously until manually stopped
-            while self.active_tasks.get(key_id, {}).get("running", False):
-                
-                # FIXED: Token rotation - each token gets different message
-                session = sessions[token_index % len(sessions)]
-                token_index += 1
-                
-                # Get NEW message for each token
-                current_message = self.message_manager.get_random_message("trade", category)
-                print(f"🔄 Token {token_index % len(sessions)} using new {category} message")
-                
-                success = await self.send_trade_message_with_template(session, channel_id, key_id, key_manager, current_message)
-                
-                if success:
-                    messages_sent += 1
-                    print(f"📤 Sent {messages_sent} trades (Token #{token_index % len(sessions)})")
-                    # Update message count periodically (every 10 messages)
-                    if messages_sent % 10 == 0:
-                        key_manager.increment_messages(key_id)
-                
-                await asyncio.sleep(delay)
-            
-            self.stop_trading(key_id)
-            print(f"✅ Auto-trader stopped for key {key_id}")
+        file_name = token_files.get(token_type, "tokens.txt")
         
-        # Start the trading loop in background
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self.active_tasks[key_id]["task"] = loop.create_task(trading_loop_with_category())
-        
-        def run_loop():
-            asyncio.set_event_loop(loop)
-            loop.run_forever()
-        
-        thread = Thread(target=run_loop, daemon=True)
-        thread.start()
+        self.title = f"Add {token_type.capitalize()} Tokens"
+        self.tokens = discord.ui.TextInput(
+            label=f"Tokens for {file_name}",
+            placeholder="email:pass:token\nor just token (one per line)",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=4000
+        )
+        self.add_item(self.tokens)
     
-    def stop_trading(self, key_id: str):
-        """Stop auto-trading for a key"""
-        if key_id in self.active_tasks:
-            self.active_tasks[key_id]["running"] = False
-            task = self.active_tasks[key_id]["task"]
-            if task:
-                task.cancel()
-            del self.active_tasks[key_id]
-            print(f"⏹️ Stopped auto-trader for key {key_id}")
+    async def on_submit(self, interaction: discord.Interaction):
+        token_files = {
+            "joiner": "tokens_joiner.txt",
+            "trader": "tokens_trade.txt",
+            "voucher": "tokens_vouch.txt",
+            "vc": "tokens_vc.txt",
+            "copier": "tokens_copier.txt"
+        }
+        
+        file_name = token_files.get(self.token_type, "tokens.txt")
+        
+        new_tokens = self.tokens.value.strip().split('\n')
+        
+        existing = []
+        if os.path.exists(file_name):
+            with open(file_name, 'r', encoding='utf-8') as f:
+                existing = [line.strip() for line in f if line.strip()]
+        
+        existing_set = set(existing)
+        
+        added = 0
+        with open(file_name, 'a', encoding='utf-8') as f:
+            for token in new_tokens:
+                token = token.strip()
+                if token and token not in existing_set:
+                    f.write(token + '\n')
+                    added += 1
+        
+        embed = discord.Embed(
+            title="✅ Tokens Added",
+            description=(
+                f"**File:** `{file_name}`\n"
+                f"**Type:** {self.token_type.capitalize()}\n"
+                f"**Added:** `{added}` new tokens\n"
+                f"**Total:** `{len(existing) + added}` tokens"
+            ),
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class GenerateKeyModal(discord.ui.Modal, title="Generate Key"):
+    def __init__(self, key_type: str):
+        super().__init__()
+        self.key_type = key_type
+        self.tokens = discord.ui.TextInput(
+            label="Number of tokens",
+            placeholder="e.g., 10, 25, 50",
+            required=True
+        )
+        self.discord_id = discord.ui.TextInput(
+            label="Customer Discord ID",
+            placeholder="123456789012345678",
+            required=True
+        )
+        self.add_item(self.tokens)
+        self.add_item(self.discord_id)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            tokens = int(self.tokens.value)
+            discord_id = self.discord_id.value
+            
+            key = key_manager.generate_key(
+                key_type=self.key_type,
+                tokens=tokens,
+                discord_id=discord_id
+            )
+            
+            dm_success = False
+            try:
+                user = await bot.fetch_user(int(discord_id))
+                if user:
+                    if self.key_type == "joiner":
+                        message_content = (
+                            f"✅ **Joiner Key Generated**\n\n"
+                            f"**Key:** `{key}`\n"
+                            f"**Tokens:** {tokens}\n"
+                            f"**Type:** Joiner (Tokens only join, no management)\n\n"
+                            f"**To Use:**\n"
+                            f"`/redeem {key} <guild_id>`\n\n"
+                            f"**Note:** Joiner keys won't appear in `/manage`"
+                        )
+                    else:
+                        message_content = (
+                            f"✅ **{self.key_type.capitalize()} Key Generated**\n\n"
+                            f"**Key:** `{key}`\n"
+                            f"**Tokens:** {tokens}\n"
+                            f"**Type:** {self.key_type.capitalize()} (Join + Auto-{self.key_type})\n\n"
+                            f"**Step 1 - Add Tokens:**\n"
+                            f"`/redeem {key} <guild_id>`\n\n"
+                            f"**Step 2 - Configure:**\n"
+                            f"After tokens join, use `/manage` to set up auto-{self.key_type}\n\n"
+                            f"**Note:** This key WILL appear in `/manage` after redemption"
+                        )
+                    
+                    await user.send(message_content)
+                    dm_success = True
+            except discord.errors.HTTPException as e:
+                if e.code == 50007:
+                    dm_success = False
+                else:
+                    raise e
+            except Exception as e:
+                print(f"Error sending DM: {e}")
+                dm_success = False
+            
+            embed = discord.Embed(
+                title="✅ Key Generated",
+                description=(
+                    f"**Type:** {self.key_type.capitalize()}\n"
+                    f"**Key:** `{key}`\n"
+                    f"**Tokens:** {tokens}\n"
+                    f"**Customer:** <@{discord_id}>\n"
+                    f"**DM Sent:** {'✅' if dm_success else '❌ (User has DMs closed)'}\n"
+                    f"**Management:** {'Yes' if self.key_type != 'joiner' else 'No'}"
+                ),
+                color=discord.Color.green() if dm_success else discord.Color.orange()
+            )
+            
+            if not dm_success:
+                embed.add_field(
+                    name="⚠️ Note",
+                    value=f"Could not send DM to <@{discord_id}>. They need to:\n1. Open DMs\n2. Use `/redeem {key} <guild_id>`",
+                    inline=False
+                )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid number or Discord ID", ephemeral=True)
+        except Exception as e:
+            print(f"Error in GenerateKeyModal: {e}")
+            await interaction.response.send_message(f"❌ Error: {str(e)[:100]}", ephemeral=True)
+            
+# ========== REDEEM COMMAND ==========
+@tree.command(name="redeem", description="Redeem your key")
+@app_commands.describe(
+    key="Your activation key",
+    guild_id="Guild ID to join"
+)
+async def redeem(interaction: discord.Interaction, key: str, guild_id: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    if key not in key_manager.keys_db:
+        await interaction.followup.send("❌ Invalid key", ephemeral=True)
+        return
+    
+    key_data = key_manager.keys_db[key]
+    
+    if key_data["used"]:
+        await interaction.followup.send("❌ Key already used", ephemeral=True)
+        return
+    
+    if not key_manager.is_key_valid(key):
+        await interaction.followup.send("❌ Key has expired (30 days)", ephemeral=True)
+        return
+    
+    if not key_manager.redeem_key(key, guild_id, str(interaction.user.id)):
+        await interaction.followup.send("❌ Failed to redeem key", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🔄 Processing...",
+        description=(
+            f"**Key:** `{key}`\n"
+            f"**Type:** {key_data['type'].capitalize()}\n"
+            f"**Goal:** {key_data['tokens']} joins\n"
+            f"**Progress:** 0/{key_data['tokens']}\n"
+            f"**Status:** Starting..."
+        ),
+        color=discord.Color.orange()
+    )
+    msg = await interaction.followup.send(embed=embed, ephemeral=True)
+    
+    # Process tokens based on key type
+    if key_data["type"] == "joiner":
+        needed, success = await process_joiner_tokens(key_data, guild_id, msg)
+    elif key_data["type"] == "trader":
+        needed, success = await process_trader_tokens(key_data, guild_id, msg)
+    elif key_data["type"] == "voucher":
+        needed, success = await process_voucher_tokens(key_data, guild_id, msg)
+    elif key_data["type"] == "vc":
+        needed, success = await process_vc_tokens(key_data, guild_id, msg)
+    elif key_data["type"] == "copier":
+        needed, success = await process_copier_tokens(key_data, guild_id, msg)
+    else:
+        needed, success = await process_joiner_tokens(key_data, guild_id, msg)
+    
+    key_manager.update_settings(key, {"completed": success, "requested": needed})
+    
+    if success >= needed:
+        final_embed = discord.Embed(
+            title="✅ Redemption Complete",
+            description=(
+                f"**Key:** `{key}`\n"
+                f"**Type:** {key_data['type'].capitalize()}\n"
+                f"**Guild:** `{guild_id}`\n"
+                f"**Requested:** {needed} joins\n"
+                f"**Completed:** {success} joins ✅"
+            ),
+            color=discord.Color.green()
+        )
+        
+        if key_data["type"] != "joiner":
+            final_embed.add_field(
+                name="🎯 Next Steps",
+                value=f"Now use `/manage` to configure and start!",
+                inline=False
+            )
+    else:
+        final_embed = discord.Embed(
+            title="⚠️ Redemption Partially Complete",
+            description=(
+                f"**Key:** `{key}`\n"
+                f"**Type:** {key_data['type'].capitalize()}\n"
+                f"**Guild:** `{guild_id}`\n"
+                f"**Requested:** {needed} joins\n"
+                f"**Completed:** {success} joins"
+            ),
+            color=discord.Color.orange()
+        )
+    
+    await msg.edit(embed=final_embed)
+
+# ========== MANAGE COMMAND ==========
+@tree.command(name="manage", description="Manage your active keys")
+async def manage(interaction: discord.Interaction):
+    """Show user's keys for management - FIXED INTERACTION HANDLING"""
+    try:
+        # DEFER FIRST to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+        
+        user_id = str(interaction.user.id)
+        
+        trader_keys = []
+        voucher_keys = []
+        vc_keys = []
+        copier_keys = []
+        
+        for key, data in key_manager.keys_db.items():
+            if data["discord_id"] == user_id and data["type"] != "joiner":
+                days_left = key_manager.get_days_remaining(key)
+                status_color = "🟢" if days_left > 7 else "🟡" if days_left > 3 else "🔴"
+                
+                key_info = {**data, "key": key, "days_left": days_left, "status_color": status_color}
+                
+                if data["type"] == "trader":
+                    trader_keys.append(key_info)
+                elif data["type"] == "voucher":
+                    voucher_keys.append(key_info)
+                elif data["type"] == "vc":
+                    vc_keys.append(key_info)
+                elif data["type"] == "copier":
+                    copier_keys.append(key_info)
+        
+        if not trader_keys and not voucher_keys and not vc_keys and not copier_keys:
+            # Use followup since we already deferred
+            await interaction.followup.send("❌ You have no active keys", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="🔑 Your Keys",
+            description="Select a key to manage:",
+            color=discord.Color.blue()
+        )
+        
+        def format_key_list(keys, key_type):
+            if not keys:
+                return []
+            
+            formatted = []
+            for k in keys[:5]:  # Limit to 5 keys per type
+                status = "🟢" if k["used"] else "🟡"
+                expiry = f"{k['status_color']} {k['days_left']}d left"
+                formatted.append(f"{status} `{k['key'][:12]}...` - {k['tokens']}t | {expiry}")
+            
+            return formatted
+        
+        key_options = []
+        
+        if trader_keys:
+            trader_list = format_key_list(trader_keys, "trader")
+            embed.add_field(
+                name="💱 Trader Keys",
+                value="\n".join(trader_list) if trader_list else "None",
+                inline=False
+            )
+            key_options.extend([(k['key'], k['type']) for k in trader_keys])
+        
+        if voucher_keys:
+            voucher_list = format_key_list(voucher_keys, "voucher")
+            embed.add_field(
+                name="⭐ Voucher Keys",
+                value="\n".join(voucher_list) if voucher_list else "None",
+                inline=False
+            )
+            key_options.extend([(k['key'], k['type']) for k in voucher_keys])
+        
+        if vc_keys:
+            vc_list = format_key_list(vc_keys, "vc")
+            embed.add_field(
+                name="🎤 VC Keys",
+                value="\n".join(vc_list) if vc_list else "None",
+                inline=False
+            )
+            key_options.extend([(k['key'], k['type']) for k in vc_keys])
+        
+        if copier_keys:
+            copier_list = format_key_list(copier_keys, "copier")
+            embed.add_field(
+                name="💬 Chat Copier Keys",
+                value="\n".join(copier_list) if copier_list else "None",
+                inline=False
+            )
+            key_options.extend([(k['key'], k['type']) for k in copier_keys])
+        
+        embed.set_footer(text="🟢 >7d | 🟡 3-7d | 🔴 <3d")
+        
+        # Limit to 25 options max (Discord limit)
+        if len(key_options) > 25:
+            key_options = key_options[:25]
+            embed.add_field(
+                name="⚠️ Note",
+                value=f"Showing first 25 of {len(trader_keys) + len(voucher_keys) + len(vc_keys) + len(copier_keys)} keys",
+                inline=False
+            )
+        
+        view = SelectKeyView(key_options)
+        
+        # Use followup.send since we already deferred
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        
+    except Exception as e:
+        print(f"❌ Error in manage command: {e}")
+        # Try to send error message if interaction is still valid
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Error: {str(e)[:100]}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error: {str(e)[:100]}", ephemeral=True)
+        except:
+            pass
+
+class SelectKeyView(discord.ui.View):
+    def __init__(self, key_options):
+        super().__init__(timeout=120)
+        
+        if not key_options:
+            # Create a disabled dropdown if no keys
+            self.dropdown = discord.ui.Select(
+                placeholder="No keys available",
+                options=[discord.SelectOption(label="No keys", description="You have no active keys", value="none")],
+                disabled=True
+            )
+            self.add_item(self.dropdown)
+            return
+        
+        # Create dropdown with keys
+        options = []
+        for key, key_type in key_options[:25]:  # Discord limit
+            # Get token count for description
+            key_data = key_manager.keys_db.get(key, {})
+            tokens = key_data.get("tokens", 0)
+            
+            options.append(
+                discord.SelectOption(
+                    label=f"{key_type.upper()} Key",
+                    description=f"{key[:12]}... - {tokens} tokens",
+                    value=f"{key_type}:{key}"
+                )
+            )
+        
+        self.dropdown = discord.ui.Select(
+            placeholder="Select a key to manage...",
+            options=options
+        )
+        self.dropdown.callback = self.key_selected
+        self.add_item(self.dropdown)
+    
+    async def key_selected(self, interaction: discord.Interaction):
+        try:
+            # Acknowledge interaction immediately
+            await interaction.response.defer(ephemeral=True)
+            
+            value = self.dropdown.values[0]
+            if value == "none":
+                return
+            
+            key_type, key = value.split(":", 1)
+            
+            # Show key management panel
+            key_data = key_manager.keys_db.get(key, {})
+            
+            if not key_data:
+                await interaction.followup.send("❌ Key not found", ephemeral=True)
+                return
+            
+            embed = discord.Embed(
+                title=f"🔧 Manage {key_type.upper()} Key",
+                description=f"**Key:** `{key}`\n**Tokens:** {key_data['tokens']}\n**Status:** {key_data['settings']['status']}",
+                color=discord.Color.blue()
+            )
+            
+            if key_type == "trader":
+                view = TraderKeyView(key)
+            elif key_type == "voucher":
+                view = VoucherKeyView(key)
+            elif key_type == "vc":
+                view = VCKeyView(key)
+            elif key_type == "copier":
+                view = ChatCopierKeyView(key)
+            else:
+                embed.description += "\n❌ This key type cannot be managed"
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            # Edit the original message
+            await interaction.edit_original_response(embed=embed, view=view)
+            
+        except Exception as e:
+            print(f"❌ Error in key_selected: {e}")
+            try:
+                await interaction.followup.send(f"❌ Error: {str(e)[:100]}", ephemeral=True)
+            except:
+                pass
+
+class TraderKeyView(discord.ui.View):
+    def __init__(self, key_id):
+        super().__init__(timeout=300)
+        self.key_id = key_id
+        
+        # Category dropdown
+        categories = ["general", "sab", "adoptme", "mix"]
+        options = []
+        for cat in categories:
+            options.append(discord.SelectOption(
+                label=cat.capitalize(),
+                description=f"{cat.capitalize()} trading messages",
+                value=cat
+            ))
+        
+        self.category_select = discord.ui.Select(
+            placeholder="Select Trading Category",
+            options=options
+        )
+        self.category_select.callback = self.on_category_select
+        self.add_item(self.category_select)
+    
+    async def on_category_select(self, interaction: discord.Interaction):
+        selected = self.category_select.values[0]
+        key_manager.update_settings(self.key_id, {"category": selected})
+        
+        embed = discord.Embed(
+            title="✅ Category Updated",
+            description=f"**Key:** `{self.key_id}`\n**Category:** {selected.capitalize()}",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        # Refresh the view
+        key_data = key_manager.keys_db[self.key_id]
+        embed = discord.Embed(
+            title=f"🔧 Manage Trader Key",
+            description=(
+                f"**Key:** `{self.key_id}`\n"
+                f"**Tokens:** {key_data['tokens']}\n"
+                f"**Status:** {key_data['settings']['status']}\n"
+                f"**Category:** {selected.capitalize()}"
+            ),
+            color=discord.Color.blue()
+        )
+        await interaction.edit_original_response(embed=embed, view=self)
+    
+    @discord.ui.button(label="Set Channel", style=discord.ButtonStyle.blurple, emoji="#️⃣")
+    async def set_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = SetChannelModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Set Delay", style=discord.ButtonStyle.gray, emoji="⏱️")
+    async def set_delay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = SetDelayModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green, row=1)
+		async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+		    key_data = key_manager.keys_db[self.key_id]
+		    
+		    # FIX: Defer and then edit original response
+		    await interaction.response.defer(ephemeral=True)
+		    
+		    if not key_data["settings"]["channel_id"]:
+		        await interaction.followup.send("❌ Please set a channel first", ephemeral=True)
+		        return
+		    
+		    # Get selected category
+		    current_category = key_data["settings"].get("category", "general")
+		    
+		    if AUTO_TRADER_AVAILABLE:
+		        auto_trader.start_trading(
+		            self.key_id,
+		            key_data["settings"]["channel_id"],
+		            key_data["settings"]["delay"],
+		            key_manager,
+		            current_category
+		        )
+		    
+		    key_manager.start_key(self.key_id)
+		    
+		    embed = discord.Embed(
+		        title="✅ Auto-Trader Started",
+		        description=(
+		            f"**Key:** `{self.key_id}`\n"
+		            f"**Channel:** <#{key_data['settings']['channel_id']}>\n"
+		            f"**Delay:** {key_data['settings']['delay']}s\n"
+		            f"**Category:** {current_category.capitalize()}\n"
+		            f"**Status:** Running..."
+		        ),
+		        color=discord.Color.green()
+		    )
+		    
+		    # FIX: Edit original response instead of edit_message
+		    await interaction.edit_original_response(embed=embed, view=self)
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if AUTO_TRADER_AVAILABLE:
+            auto_trader.stop_trading(self.key_id)
+        
+        key_manager.stop_key(self.key_id)
+        
+        embed = discord.Embed(
+            title="⏹️ Auto-Trader Stopped",
+            description=f"**Key:** `{self.key_id}`\n**Status:** Stopped",
+            color=discord.Color.orange()
+        )
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+
+class VoucherKeyView(discord.ui.View):
+    def __init__(self, key_id):
+        super().__init__(timeout=300)
+        self.key_id = key_id
+        
+        # Category dropdown
+        categories = ["general", "sab", "adoptme", "mix"]
+        options = []
+        for cat in categories:
+            options.append(discord.SelectOption(
+                label=cat.capitalize(),
+                description=f"{cat.capitalize()} vouching messages",
+                value=cat
+            ))
+        
+        self.category_select = discord.ui.Select(
+            placeholder="Select Vouching Category",
+            options=options
+        )
+        self.category_select.callback = self.on_category_select
+        self.add_item(self.category_select)
+    
+    async def on_category_select(self, interaction: discord.Interaction):
+        selected = self.category_select.values[0]
+        key_manager.update_settings(self.key_id, {"category": selected})
+        
+        embed = discord.Embed(
+            title="✅ Category Updated",
+            description=f"**Key:** `{self.key_id}`\n**Category:** {selected.capitalize()}",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        # Refresh the view
+        key_data = key_manager.keys_db[self.key_id]
+        embed = discord.Embed(
+            title=f"🔧 Manage Voucher Key",
+            description=(
+                f"**Key:** `{self.key_id}`\n"
+                f"**Tokens:** {key_data['tokens']}\n"
+                f"**Status:** {key_data['settings']['status']}\n"
+                f"**Category:** {selected.capitalize()}"
+            ),
+            color=discord.Color.blue()
+        )
+        await interaction.edit_original_response(embed=embed, view=self)
+    
+    
+    @discord.ui.button(label="Set Channel", style=discord.ButtonStyle.blurple, emoji="#️⃣")
+    async def set_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = SetChannelModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Set Delay", style=discord.ButtonStyle.gray, emoji="⏱️")
+    async def set_delay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = SetDelayModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Add Users", style=discord.ButtonStyle.green, emoji="➕")
+    async def add_users(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = AddUsersModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Remove Users", style=discord.ButtonStyle.red, emoji="➖")
+    async def remove_users(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = RemoveUsersModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green, row=1)
+		async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+		    key_data = key_manager.keys_db[self.key_id]
+		    
+		    # FIX: Defer and then edit original response
+		    await interaction.response.defer(ephemeral=True)
+		    
+		    if not key_data["settings"]["channel_id"]:
+		        await interaction.followup.send("❌ Please set a channel first", ephemeral=True)
+		        return
+		    
+		    # Get selected category
+		    current_category = key_data["settings"].get("category", "general")
+		    
+		    if AUTO_TRADER_AVAILABLE:
+		        auto_trader.start_trading(
+		            self.key_id,
+		            key_data["settings"]["channel_id"],
+		            key_data["settings"]["delay"],
+		            key_manager,
+		            current_category
+		        )
+		    
+		    key_manager.start_key(self.key_id)
+		    
+		    embed = discord.Embed(
+		        title="✅ Auto-Trader Started",
+		        description=(
+		            f"**Key:** `{self.key_id}`\n"
+		            f"**Channel:** <#{key_data['settings']['channel_id']}>\n"
+		            f"**Delay:** {key_data['settings']['delay']}s\n"
+		            f"**Category:** {current_category.capitalize()}\n"
+		            f"**Status:** Running..."
+		        ),
+		        color=discord.Color.green()
+		    )
+		    
+		    # FIX: Edit original response instead of edit_message
+		    await interaction.edit_original_response(embed=embed, view=self)
+		    
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if AUTO_VOUCHER_AVAILABLE:
+            auto_voucher.stop_vouching(self.key_id)
+        
+        key_manager.stop_key(self.key_id)
+        
+        embed = discord.Embed(
+            title="⏹️ Auto-Voucher Stopped",
+            description=f"**Key:** `{self.key_id}`\n**Status:** Stopped",
+            color=discord.Color.orange()
+        )
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+
+class VCKeyView(discord.ui.View):
+    def __init__(self, key_id):
+        super().__init__(timeout=300)
+        self.key_id = key_id
+    
+    @discord.ui.button(label="Add VC Channel", style=discord.ButtonStyle.primary, emoji="➕")
+    async def add_vc_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Add a VC channel"""
+        modal = AddVCChannelModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Remove VC Channel", style=discord.ButtonStyle.danger, emoji="➖")
+    async def remove_vc_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Remove a VC channel"""
+        modal = RemoveVCChannelModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Start VC joining"""
+        # Get key data
+        key_data = key_manager.keys_db.get(self.key_id, {})
+        
+        if not key_data:
+            await interaction.response.send_message("❌ Key not found", ephemeral=True)
+            return
+        
+        # Check if we have VC channels configured
+        if not key_data["settings"].get("vc_channels"):
+            await interaction.response.send_message("❌ Please add VC channels first", ephemeral=True)
+            return
+        
+        # Get guild ID
+        guild_id = key_data.get("redeemed_guild", "")
+        if not guild_id:
+            await interaction.response.send_message("❌ No guild ID found. Did you redeem the key first?", ephemeral=True)
+            return
+        
+        # Start VC joining
+        if VC_JOINER_AVAILABLE:
+            vc_joiner.start_vc_joining(
+                self.key_id,
+                key_data["settings"]["vc_channels"],
+                key_data["settings"].get("delay", 5),
+                key_manager,
+                guild_id
+            )
+            
+            # Update key status
+            key_manager.start_key(self.key_id)
+            
+            # Create success embed
+            embed = discord.Embed(
+                title="✅ VC Joiner Started",
+                description=(
+                    f"**Key:** `{self.key_id}`\n"
+                    f"**Guild:** `{guild_id}`\n"
+                    f"**VC Channels:** {len(key_data['settings']['vc_channels'])}\n"
+                    f"**Tokens:** {key_data['tokens']}\n"
+                    f"**Status:** Joining voice channels..."
+                ),
+                color=discord.Color.green()
+            )
+            
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.send_message("❌ VC Joiner module not available", ephemeral=True)
+    
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Stop VC joining"""
+        # Stop VC joining
+        if VC_JOINER_AVAILABLE:
+            vc_joiner.stop_vc_joining(self.key_id)
+        
+        # Update key status
+        key_manager.stop_key(self.key_id)
+        
+        # Create embed
+        embed = discord.Embed(
+            title="⏹️ VC Joiner Stopped",
+            description=f"**Key:** `{self.key_id}`\n**Status:** Stopped",
+            color=discord.Color.orange()
+        )
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+
+class AddVCChannelModal(discord.ui.Modal, title="Add VC Channel"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.channel_id = discord.ui.TextInput(
+            label="VC Channel ID",
+            placeholder="123456789012345678",
+            required=True
+        )
+        self.add_item(self.channel_id)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = self.channel_id.value.strip()
+        
+        if not channel_id.isdigit():
+            await interaction.response.send_message("❌ Invalid channel ID", ephemeral=True)
+            return
+        
+        # Get current VC channels
+        key_data = key_manager.keys_db.get(self.key_id, {})
+        current_channels = key_data["settings"].get("vc_channels", [])
+        
+        # Add new channel
+        if channel_id not in current_channels:
+            current_channels.append(channel_id)
+        
+        # Update settings
+        key_manager.update_settings(self.key_id, {"vc_channels": current_channels})
+        
+        await interaction.response.send_message(f"✅ Added VC channel {channel_id}", ephemeral=True)
+
+class RemoveVCChannelModal(discord.ui.Modal, title="Remove VC Channel"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.channel_id = discord.ui.TextInput(
+            label="VC Channel ID to remove",
+            placeholder="123456789012345678",
+            required=True
+        )
+        self.add_item(self.channel_id)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = self.channel_id.value.strip()
+        
+        if not channel_id.isdigit():
+            await interaction.response.send_message("❌ Invalid channel ID", ephemeral=True)
+            return
+        
+        # Get current VC channels
+        key_data = key_manager.keys_db.get(self.key_id, {})
+        current_channels = key_data["settings"].get("vc_channels", [])
+        
+        # Remove the channel
+        if channel_id in current_channels:
+            current_channels.remove(channel_id)
+            key_manager.update_settings(self.key_id, {"vc_channels": current_channels})
+            msg = f"✅ Removed VC channel {channel_id}"
+        else:
+            msg = f"⚠️ Channel {channel_id} not found in configuration"
+        
+        await interaction.response.send_message(msg, ephemeral=True)
+        
+class ChatCopierKeyView(discord.ui.View):
+    def __init__(self, key_id):
+        super().__init__(timeout=300)
+        self.key_id = key_id
+    
+    @discord.ui.button(label="Set Target Channel", style=discord.ButtonStyle.blurple, emoji="📤")
+    async def set_target_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = SetTargetChannelModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Set Delay", style=discord.ButtonStyle.gray, emoji="⏱️")
+    async def set_delay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = SetDelayModal(self.key_id)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Acknowledge interaction immediately
+        await interaction.response.defer(ephemeral=True)
+        
+        key_data = key_manager.keys_db.get(self.key_id, {})
+        
+        if not key_data:
+            await interaction.followup.send("❌ Key not found", ephemeral=True)
+            return
+        
+        target_channel = key_data["settings"].get("target_channel_id")
+        
+        if not target_channel:
+            await interaction.followup.send("❌ Please set the target channel first", ephemeral=True)
+            return
+        
+        # Check if chat copier is configured
+        if not hasattr(chat_copier, 'source_token') or not chat_copier.source_token:
+            await interaction.followup.send("❌ Chat copier not configured in config.json", ephemeral=True)
+            return
+        
+        # Update key status FIRST
+        key_manager.start_key(self.key_id)
+        
+        if CHAT_COPIER_AVAILABLE:
+            chat_copier.start_chat_copying(
+                self.key_id,
+                target_channel,
+                key_data["settings"]["delay"],
+                key_manager
+            )
+        
+        # Get UPDATED key data after starting
+        key_data = key_manager.keys_db.get(self.key_id, {})
+        
+        # Create UPDATED embed
+        embed = discord.Embed(
+            title="✅ Chat Copier Started",
+            description=(
+                f"**Key:** `{self.key_id}`\n"
+                f"**Status:** {key_data['settings']['status']}\n"
+                f"**Tokens:** {key_data['tokens']}\n"
+                f"**Target Channel:** {target_channel}\n"
+                f"**Delay:** {key_data['settings']['delay']}s\n"
+                f"**Messages Sent:** {key_data['settings']['messages_sent']}\n"
+                f"**Source:** Configured in config.json"
+            ),
+            color=discord.Color.green()
+        )
+        
+        # Create a NEW view (refresh the buttons)
+        new_view = ChatCopierKeyView(self.key_id)
+        
+        # Edit the original response with UPDATED embed
+        await interaction.edit_original_response(embed=embed, view=new_view)
+    
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Acknowledge interaction immediately
+        await interaction.response.defer(ephemeral=True)
+        
+        # Update key status FIRST
+        key_manager.stop_key(self.key_id)
+        
+        if CHAT_COPIER_AVAILABLE:
+            chat_copier.stop_chat_copying(self.key_id)
+        
+        # Get UPDATED key data
+        key_data = key_manager.keys_db.get(self.key_id, {})
+        
+        # Create UPDATED embed
+        embed = discord.Embed(
+            title="⏹️ Chat Copier Stopped",
+            description=(
+                f"**Key:** `{self.key_id}`\n"
+                f"**Status:** {key_data['settings']['status']}\n"
+                f"**Tokens:** {key_data['tokens']}\n"
+                f"**Total Messages Sent:** {key_data['settings']['messages_sent']}"
+            ),
+            color=discord.Color.orange()
+        )
+        
+        # Create a NEW view
+        new_view = ChatCopierKeyView(self.key_id)
+        
+        # Edit the original response
+        await interaction.edit_original_response(embed=embed, view=new_view)
+    
+    @discord.ui.button(label="← Back", style=discord.ButtonStyle.gray, emoji="⬅️")
+    async def go_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to the key list"""
+        await self.show_key_list(interaction)
+    
+    async def show_key_list(self, interaction: discord.Interaction):
+        """Show the key list (go back to /manage view)"""
+        await interaction.response.defer(ephemeral=True)
+        
+        user_id = str(interaction.user.id)
+        
+        # Get user's keys
+        trader_keys = []
+        voucher_keys = []
+        vc_keys = []
+        copier_keys = []
+        
+        for key, data in key_manager.keys_db.items():
+            if data["discord_id"] == user_id and data["type"] != "joiner":
+                days_left = key_manager.get_days_remaining(key)
+                status_color = "🟢" if days_left > 7 else "🟡" if days_left > 3 else "🔴"
+                
+                key_info = {**data, "key": key, "days_left": days_left, "status_color": status_color}
+                
+                if data["type"] == "trader":
+                    trader_keys.append(key_info)
+                elif data["type"] == "voucher":
+                    voucher_keys.append(key_info)
+                elif data["type"] == "vc":
+                    vc_keys.append(key_info)
+                elif data["type"] == "copier":
+                    copier_keys.append(key_info)
+        
+        if not trader_keys and not voucher_keys and not vc_keys and not copier_keys:
+            await interaction.followup.send("❌ You have no active keys", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="🔑 Your Keys",
+            description="Select a key to manage:",
+            color=discord.Color.blue()
+        )
+        
+        def format_key_list(keys, key_type):
+            if not keys:
+                return []
+            
+            formatted = []
+            for k in keys[:5]:
+                status = "🟢" if k["used"] else "🟡"
+                expiry = f"{k['status_color']} {k['days_left']}d left"
+                formatted.append(f"{status} `{k['key'][:12]}...` - {k['tokens']}t | {expiry}")
+            
+            return formatted
+        
+        key_options = []
+        
+        if trader_keys:
+            trader_list = format_key_list(trader_keys, "trader")
+            embed.add_field(
+                name="💱 Trader Keys",
+                value="\n".join(trader_list) if trader_list else "None",
+                inline=False
+            )
+            key_options.extend([(k['key'], k['type']) for k in trader_keys])
+        
+        if voucher_keys:
+            voucher_list = format_key_list(voucher_keys, "voucher")
+            embed.add_field(
+                name="⭐ Voucher Keys",
+                value="\n".join(voucher_list) if voucher_list else "None",
+                inline=False
+            )
+            key_options.extend([(k['key'], k['type']) for k in voucher_keys])
+        
+        if vc_keys:
+            vc_list = format_key_list(vc_keys, "vc")
+            embed.add_field(
+                name="🎤 VC Keys",
+                value="\n".join(vc_list) if vc_list else "None",
+                inline=False
+            )
+            key_options.extend([(k['key'], k['type']) for k in vc_keys])
+        
+        if copier_keys:
+            copier_list = format_key_list(copier_keys, "copier")
+            embed.add_field(
+                name="💬 Chat Copier Keys",
+                value="\n".join(copier_list) if copier_list else "None",
+                inline=False
+            )
+            key_options.extend([(k['key'], k['type']) for k in copier_keys])
+        
+        embed.set_footer(text="🟢 >7d | 🟡 3-7d | 🔴 <3d")
+        
+        view = SelectKeyView(key_options)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+class JoinerKeyView(discord.ui.View):
+    def __init__(self, key_id):
+        super().__init__(timeout=120)
+        self.key_id = key_id
+    
+    @discord.ui.button(label="View Details", style=discord.ButtonStyle.blurple)
+    async def view_details(self, interaction: discord.Interaction, button: discord.ui.Button):
+        key_data = key_manager.keys_db[self.key_id]
+        
+        embed = discord.Embed(
+            title="👥 Joiner Key Details",
+            description=(
+                f"**Key:** `{self.key_id}`\n"
+                f"**Tokens:** {key_data['tokens']}\n"
+                f"**Status:** {key_data['settings']['status']}\n"
+                f"**Used At:** {key_data['used_at'] or 'Not used'}\n"
+                f"**Guild:** {key_data['redeemed_guild'] or 'Not redeemed'}"
+            ),
+            color=discord.Color.blue()
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class AddVCChannelModal(discord.ui.Modal, title="Add VC Channel"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.channel_id = discord.ui.TextInput(
+            label="VC Channel ID",
+            placeholder="123456789012345678",
+            required=True
+        )
+        self.tokens_per_channel = discord.ui.TextInput(
+            label="Tokens for this channel (leave empty for all)",
+            placeholder="e.g., 5 or leave empty to use all tokens",
+            required=False
+        )
+        self.add_item(self.channel_id)
+        self.add_item(self.tokens_per_channel)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = self.channel_id.value.strip()
+        
+        if not channel_id.isdigit():
+            await interaction.response.send_message("❌ Invalid channel ID", ephemeral=True)
+            return
+        
+        # Get current VC channels
+        key_data = key_manager.keys_db.get(self.key_id, {})
+        current_channels = key_data["settings"].get("vc_channels", [])
+        
+        # Add new channel
+        if channel_id not in current_channels:
+            current_channels.append(channel_id)
+        
+        # Update settings
+        key_manager.update_settings(self.key_id, {"vc_channels": current_channels})
+        
+        # Store tokens per channel if specified
+        if self.tokens_per_channel.value.strip():
+            try:
+                tokens_count = int(self.tokens_per_channel.value.strip())
+                # Store this in a separate setting for token distribution per channel
+                token_distribution = key_data["settings"].get("token_distribution", {})
+                token_distribution[channel_id] = tokens_count
+                key_manager.update_settings(self.key_id, {"token_distribution": token_distribution})
+                msg = f"✅ Added VC channel {channel_id} with {tokens_count} tokens"
+            except ValueError:
+                msg = f"✅ Added VC channel {channel_id} (invalid token count, using all tokens)"
+        else:
+            msg = f"✅ Added VC channel {channel_id} (using all tokens)"
+        
+        await interaction.response.send_message(msg, ephemeral=True)
+
+class RemoveVCChannelModal(discord.ui.Modal, title="Remove VC Channel"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.channel_id = discord.ui.TextInput(
+            label="VC Channel ID to remove tokens from",
+            placeholder="123456789012345678",
+            required=True
+        )
+        self.add_item(self.channel_id)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = self.channel_id.value.strip()
+        
+        # Get current VC channels
+        key_data = key_manager.keys_db.get(self.key_id, {})
+        current_channels = key_data["settings"].get("vc_channels", [])
+        
+        # Remove the channel
+        if channel_id in current_channels:
+            current_channels.remove(channel_id)
+            key_manager.update_settings(self.key_id, {"vc_channels": current_channels})
+            
+            # Also remove token distribution for this channel
+            token_distribution = key_data["settings"].get("token_distribution", {})
+            if channel_id in token_distribution:
+                del token_distribution[channel_id]
+                key_manager.update_settings(self.key_id, {"token_distribution": token_distribution})
+            
+            msg = f"✅ Removed VC channel {channel_id}"
+        else:
+            msg = f"⚠️ Channel {channel_id} not found in configuration"
+        
+        await interaction.response.send_message(msg, ephemeral=True)
+        
+class SetChannelModal(discord.ui.Modal, title="Set Channel"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.channel_id = discord.ui.TextInput(
+            label="Channel ID",
+            placeholder="123456789012345678",
+            required=True
+        )
+        self.add_item(self.channel_id)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        key_manager.update_settings(self.key_id, {"channel_id": self.channel_id.value})
+        await interaction.response.send_message(f"✅ Channel set to {self.channel_id.value}", ephemeral=True)
+
+class SetTargetChannelModal(discord.ui.Modal, title="Set Target Channel"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.channel_id = discord.ui.TextInput(
+            label="Target Channel ID",
+            placeholder="Channel ID to copy TO",
+            required=True
+        )
+        self.add_item(self.channel_id)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = self.channel_id.value.strip()
+        
+        if not channel_id.isdigit():
+            await interaction.response.send_message("❌ Invalid channel ID", ephemeral=True)
+            return
+        
+        key_manager.update_settings(self.key_id, {"target_channel_id": channel_id})
+        await interaction.response.send_message(f"✅ Target channel set to {channel_id}", ephemeral=True)
+
+class SetDelayModal(discord.ui.Modal, title="Set Delay"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.delay = discord.ui.TextInput(
+            label="Delay in seconds",
+            placeholder="e.g., 5, 10, 30",
+            required=True
+        )
+        self.add_item(self.delay)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            delay = int(self.delay.value)
+            key_manager.update_settings(self.key_id, {"delay": delay})
+            await interaction.response.send_message(f"✅ Delay set to {delay} seconds", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid number", ephemeral=True)
+
+class AddUsersModal(discord.ui.Modal, title="Add Users"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.users = discord.ui.TextInput(
+            label="User IDs (separate by comma or new line)",
+            placeholder="123456789012345678, 987654321098765432",
+            style=discord.TextStyle.paragraph,
+            required=True
+        )
+        self.add_item(self.users)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        users_text = self.users.value
+        users = []
+        
+        for line in users_text.split('\n'):
+            for user in line.split(','):
+                user = user.strip()
+                if user:
+                    users.append(user)
+        
+        message_manager.add_users_to_list(self.key_id, users)
+        
+        await interaction.response.send_message(
+            f"✅ Added {len(users)} users to key {self.key_id[:12]}...",
+            ephemeral=True
+        )
+
+class RemoveUsersModal(discord.ui.Modal, title="Remove Users"):
+    def __init__(self, key_id):
+        super().__init__()
+        self.key_id = key_id
+        self.users = discord.ui.TextInput(
+            label="User IDs to remove",
+            placeholder="123456789012345678, 987654321098765432",
+            style=discord.TextStyle.paragraph,
+            required=True
+        )
+        self.add_item(self.users)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        users_text = self.users.value
+        users = []
+        
+        for line in users_text.split('\n'):
+            for user in line.split(','):
+                user = user.strip()
+                if user:
+                    users.append(user)
+        
+        message_manager.remove_users_from_list(self.key_id, users)
+        
+        await interaction.response.send_message(
+            f"✅ Removed {len(users)} users from key {self.key_id[:12]}...",
+            ephemeral=True
+        )
+
+@bot.event
+async def on_message(message):
+    if message.channel.id != WEBHOOK_CHANNEL_ID:
+        return
+    
+    if not message.webhook_id:
+        return
+    
+    await process_shop_webhook(message)
+
+async def process_shop_webhook(message):
+    """Process shop webhook message"""
+    try:
+        content = message.content
+        
+        try:
+            data = json.loads(content)
+        except:
+            if message.embeds:
+                embed = message.embeds[0]
+                if embed.description:
+                    desc = embed.description
+                    if "{" in desc and "}" in desc:
+                        json_str = desc[desc.find("{"):desc.rfind("}")+1]
+                        data = json.loads(json_str)
+                    else:
+                        return
+                else:
+                    return
+            else:
+                return
+        
+        if data.get("event") != "INVOICE.ITEM.DELIVER-DYNAMIC":
+            return
+        
+        amount = data.get("amount", 1)
+        customer = data.get("customer", {})
+        discord_id = customer.get("discord_id", "")
+        discord_username = customer.get("discord_username", "Unknown")
+        
+        # Determine key type based on product or other data
+        key_type = "joiner"  # Default
+        
+        # Generate key
+        key = key_manager.generate_key(
+            key_type=key_type,
+            tokens=amount,
+            discord_id=discord_id,
+            discord_username=discord_username
+        )
+        
+        # Send response
+        await message.channel.send(key)
+        
+        # Log
+        log_channel = bot.get_channel(PRIVATE_LOG_CHANNEL_ID)
+        if log_channel:
+            embed = discord.Embed(
+                title="🛒 New Order",
+                description=(
+                    f"**Customer:** {discord_username}\n"
+                    f"**Type:** {key_type}\n"
+                    f"**Amount:** {amount}\n"
+                    f"**Key:** `{key}`"
+                ),
+                color=discord.Color.green()
+            )
+            await log_channel.send(embed=embed)
+        
+        print(f"✅ Order processed: {discord_username} | Key: {key}")
+        
+    except Exception as e:
+        print(f"❌ Webhook error: {e}")
+
+bot.run(config["bot_token"])
