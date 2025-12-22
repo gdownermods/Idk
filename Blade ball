@@ -7,11 +7,8 @@ from threading import Thread
 from message_manager import MessageManager
 from auth_system import Authorize, GuildJoiner
 import requests
-import re
-import json
-import os
 
-class AutoVoucher:
+class AutoTrader:
     def __init__(self, config: Dict):
         self.config = config
         self.message_manager = MessageManager()
@@ -19,9 +16,9 @@ class AutoVoucher:
         self.active_tasks = {}
         
     def load_tokens(self) -> List[str]:
-        """Load voucher tokens from file"""
+        """Load trader tokens from file"""
         try:
-            with open('tokens_vouch.txt', 'r') as f:
+            with open('tokens_trade.txt', 'r') as f:
                 return [line.strip() for line in f if line.strip()]
         except FileNotFoundError:
             return []
@@ -53,7 +50,7 @@ class AutoVoucher:
             
             user_id, access_token, refresh_token, discord_token = result
             
-            # Create session
+            # Create session (proxy is already handled by the auth system)
             session = requests.Session()
             
             return {
@@ -67,142 +64,39 @@ class AutoVoucher:
             print(f"❌ Failed to auth token: {e}")
             return None
     
-    def validate_discord_message(self, message: str) -> bool:
-        """Check if a message is valid for Discord"""
-        if not message or len(message.strip()) == 0:
-            return False
-        
-        if len(message) > 2000:
-            print(f"⚠️ Message too long: {len(message)} chars")
-            return False
-        
-        # Check for any obvious issues
-        if "@everyone" in message or "@here" in message:
-            print("⚠️ Message contains @everyone or @here")
-            return False
-        
-        return True
-    
-    def get_user_rotation_state(self, key_id: str) -> Dict:
-        """Get current rotation state for users"""
-        rotation_file = f"user_rotation_{key_id}.json"
+    async def send_trade_message_with_template(self, session_data: Dict, channel_id: str, key_id: str, key_manager, message: str):
+        """Send a trade message using a specific message"""
         try:
-            if os.path.exists(rotation_file):
-                with open(rotation_file, 'r') as f:
-                    return json.load(f)
-        except:
-            pass
-        
-        return {"current_index": 0}
-    
-    def update_user_rotation(self, key_id: str, new_index: int):
-        """Update rotation index for users"""
-        rotation_file = f"user_rotation_{key_id}.json"
-        state = {"current_index": new_index}
-        try:
-            with open(rotation_file, 'w') as f:
-                json.dump(state, f)
-        except:
-            pass
-    
-    async def send_vouch_message_with_template(self, session_data: Dict, channel_id: str, key_id: str, key_manager, message_template: str, category: str = "general"):
-        """Send a vouch message using a specific template with user rotation"""
-        try:
-            # Get all users for this key
-            all_users = self.message_manager.load_user_list(key_id)
-            if not all_users:
-                print(f"⚠️ No users configured for key {key_id}")
-                return False
-            
-            # Get rotation state
-            rotation_state = self.get_user_rotation_state(key_id)
-            user_index = rotation_state.get("current_index", 0)
-            
-            # Get next user in rotation
-            target_user = all_users[user_index % len(all_users)]
-            
-            # Update rotation for next time
-            self.update_user_rotation(key_id, (user_index + 1) % len(all_users))
-            
-            # Format the user mention
-            if target_user.isdigit() and len(target_user) >= 17:
-                user_mention = f"<@{target_user}>"
-            elif target_user.startswith("<@") and target_user.endswith(">"):
-                user_mention = target_user
-            else:
-                user_mention = f"<@{target_user}>"
-            
-            # Find ALL user mentions in the template
-            mention_pattern = r'<@!?\d{17,19}>'
-            mentions = re.findall(mention_pattern, message_template)
-            
-            if mentions:
-                # Replace the first mention in the template with our target user
-                message = message_template
-                for i, mention in enumerate(mentions):
-                    if i == 0:
-                        message = message.replace(mention, user_mention, 1)
-            else:
-                message = f"Vouch {user_mention}! {message_template}"
-            
-            # Validate message
-            if not self.validate_discord_message(message):
-                print(f"❌ Invalid message, skipping: {message[:50]}...")
-                return False
-            
-            # Prepare request
             headers = {
                 "Authorization": session_data["token"],
                 "Content-Type": "application/json"
             }
             
-            user_id = target_user.strip("<@!>")
-            
             payload = {
                 "content": message,
-                "tts": False,
-                "allowed_mentions": {
-                    "users": [user_id] if user_id.isdigit() else []
-                }
+                "tts": False
             }
             
             url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
             
             async with aiohttp.ClientSession() as http_session:
                 async with http_session.post(url, json=payload, headers=headers) as response:
-                    response_text = await response.text()
-                    
                     if response.status in (200, 201, 204):
-                        print(f"✅ Vouch message sent for {user_mention} ({user_index % len(all_users) + 1}/{len(all_users)})")
+                        print(f"✅ Trade message sent to channel {channel_id}")
                         key_manager.increment_messages(key_id)
                         return True
                     else:
-                        print(f"❌ Failed to send vouch message: {response.status}")
+                        print(f"❌ Failed to send trade message: {response.status}")
                         return False
-                        
+                            
         except Exception as e:
-            print(f"❌ Error sending vouch message: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ Error sending trade message: {e}")
             return False
     
-    def start_vouching(self, key_id: str, channel_id: str, delay: int, key_manager, category: str = "general"):
-        """Start auto-vouching for a key with specified category"""
-        print(f"DEBUG: Starting vouching for key {key_id}, channel {channel_id}, category: {category}")
-        
+    def start_trading(self, key_id: str, channel_id: str, delay: int, key_manager, category: str = "general"):
+        """Start auto-trading for a key with specified category"""
         if key_id in self.active_tasks:
-            print(f"⚠️ Vouching already running for key {key_id}")
-            return
-        
-        # Check if channel ID is valid
-        if not channel_id or not str(channel_id).isdigit():
-            print(f"❌ Invalid channel ID: {channel_id}")
-            return
-        
-        # Check if users list exists
-        users = self.message_manager.load_user_list(key_id)
-        if not users:
-            print(f"⚠️ No users configured for key {key_id}")
+            print(f"⚠️ Trading already running for key {key_id}")
             return
         
         # Update category setting
@@ -222,10 +116,10 @@ class AutoVoucher:
             "category": category
         }
         
-        async def vouching_loop_with_category():
+        async def trading_loop_with_category():
             tokens = self.load_tokens()
             if not tokens:
-                print("❌ No voucher tokens available")
+                print("❌ No trader tokens available")
                 return
             
             usable_tokens = tokens[:max_tokens]
@@ -243,18 +137,15 @@ class AutoVoucher:
                     sessions.append(session)
             
             if not sessions:
-                print("❌ No valid voucher tokens")
+                print("❌ No valid trader tokens")
                 return
             
-            users = self.message_manager.load_user_list(key_id)
-            print(f"✅ Starting auto-voucher with {len(sessions)} tokens for {len(users)} users, category: {category}")
+            print(f"✅ Starting auto-trader with {len(sessions)} tokens, category: {category}")
             
             token_index = 0
             messages_sent = 0
-            current_message = None
-            message_repeat_count = 0
-            max_repeat = random.randint(10, 30)
             
+            # Run continuously until manually stopped
             while self.active_tasks.get(key_id, {}).get("running", False):
                 
                 # FIXED: Token rotation - each token gets different message
@@ -262,26 +153,27 @@ class AutoVoucher:
                 token_index += 1
                 
                 # Get NEW message for each token
-                current_message = self.message_manager.get_random_message("vouch", category)
+                current_message = self.message_manager.get_random_message("trade", category)
                 print(f"🔄 Token {token_index % len(sessions)} using new {category} message")
                 
-                success = await self.send_vouch_message_with_template(session, channel_id, key_id, key_manager, current_message, category)
+                success = await self.send_trade_message_with_template(session, channel_id, key_id, key_manager, current_message)
                 
                 if success:
                     messages_sent += 1
-                    print(f"📤 Sent {messages_sent} vouches (Token #{token_index % len(sessions)})")
-                    if messages_sent % 5 == 0:
+                    print(f"📤 Sent {messages_sent} trades (Token #{token_index % len(sessions)})")
+                    # Update message count periodically (every 10 messages)
+                    if messages_sent % 10 == 0:
                         key_manager.increment_messages(key_id)
                 
                 await asyncio.sleep(delay)
             
-            self.stop_vouching(key_id)
-            print(f"✅ Auto-voucher stopped for key {key_id}")
+            self.stop_trading(key_id)
+            print(f"✅ Auto-trader stopped for key {key_id}")
         
-        # Start the vouching loop in background
+        # Start the trading loop in background
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        self.active_tasks[key_id]["task"] = loop.create_task(vouching_loop_with_category())
+        self.active_tasks[key_id]["task"] = loop.create_task(trading_loop_with_category())
         
         def run_loop():
             asyncio.set_event_loop(loop)
@@ -290,12 +182,12 @@ class AutoVoucher:
         thread = Thread(target=run_loop, daemon=True)
         thread.start()
     
-    def stop_vouching(self, key_id: str):
-        """Stop auto-vouching for a key"""
+    def stop_trading(self, key_id: str):
+        """Stop auto-trading for a key"""
         if key_id in self.active_tasks:
             self.active_tasks[key_id]["running"] = False
             task = self.active_tasks[key_id]["task"]
             if task:
                 task.cancel()
             del self.active_tasks[key_id]
-            print(f"⏹️ Stopped auto-voucher for key {key_id}")
+            print(f"⏹️ Stopped auto-trader for key {key_id}")
