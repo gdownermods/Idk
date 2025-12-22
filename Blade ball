@@ -223,73 +223,78 @@ class AutoVoucher:
         }
         
         async def vouching_loop_with_category():
-		    tokens = self.load_tokens()
-		    if not tokens:
-		        print("❌ No voucher tokens available")
-		        return
-		    
-		    usable_tokens = tokens[:max_tokens]
-		    print(f"✅ Using {len(usable_tokens)}/{max_tokens} tokens for key {key_id} with category: {category}")
-		    
-		    if not usable_tokens:
-		        print("❌ No usable tokens")
-		        return
-		    
-		    # Authorize only the tokens we'll use
-		    sessions = []
-		    for token_line in usable_tokens:
-		        session = self.get_token_session(token_line)
-		        if session:
-		            sessions.append(session)
-		    
-		    if not sessions:
-		        print("❌ No valid voucher tokens")
-		        return
-		    
-		    users = self.message_manager.load_user_list(key_id)
-		    print(f"✅ Starting auto-voucher with {len(sessions)} tokens for {len(users)} users, category: {category}")
-		    
-		    token_index = 0
-		    messages_sent = 0
-		    current_message = None
-		    message_repeat_count = 0
-		    max_repeat = random.randint(10, 30)
-		    
-		    # FIXED LINE - No tabs/spaces mix, and no auto-stop condition
-		    while self.active_tasks.get(key_id, {}).get("running", False):
-		        
-		        session = sessions[token_index % len(sessions)]
-		        
-		        if current_message is None or message_repeat_count >= max_repeat:
-		            current_message = self.message_manager.get_random_message("vouch", category)
-		            message_repeat_count = 0
-		            max_repeat = random.randint(10, 30)
-		            print(f"🔄 Switching to new {category} message (will repeat {max_repeat} times)")
-		        
-		        success = await self.send_vouch_message_with_template(session, channel_id, key_id, key_manager, current_message, category)
-		        
-		        if success:
-		            messages_sent += 1
-		            message_repeat_count += 1
-		            print(f"📤 Sent {messages_sent} vouches (Message #{message_repeat_count}/{max_repeat})")
-		        
-		        token_index += 1
-		        await asyncio.sleep(delay)
-		    
-		    self.stop_vouching(key_id)
-		    print(f"✅ Auto-voucher stopped for key {key_id}")
-		
-		        # Start the vouching loop in background
-		        loop = asyncio.new_event_loop()
-		        asyncio.set_event_loop(loop)
-		        self.active_tasks[key_id]["task"] = loop.create_task(vouching_loop_with_category())
-		        
-		        def run_loop():
-		            asyncio.set_event_loop(loop)
-		            loop.run_forever()
-		        
-		        thread = Thread(target=run_loop, daemon=True)
-		        thread.start()
+            tokens = self.load_tokens()
+            if not tokens:
+                print("❌ No voucher tokens available")
+                return
+            
+            usable_tokens = tokens[:max_tokens]
+            print(f"✅ Using {len(usable_tokens)}/{max_tokens} tokens for key {key_id} with category: {category}")
+            
+            if not usable_tokens:
+                print("❌ No usable tokens")
+                return
+            
+            # Authorize only the tokens we'll use
+            sessions = []
+            for token_line in usable_tokens:
+                session = self.get_token_session(token_line)
+                if session:
+                    sessions.append(session)
+            
+            if not sessions:
+                print("❌ No valid voucher tokens")
+                return
+            
+            users = self.message_manager.load_user_list(key_id)
+            print(f"✅ Starting auto-voucher with {len(sessions)} tokens for {len(users)} users, category: {category}")
+            
+            token_index = 0
+            messages_sent = 0
+            current_message = None
+            message_repeat_count = 0
+            max_repeat = random.randint(10, 30)
+            
+            # FIX 2: Removed message limit - runs until manually stopped
+            while self.active_tasks.get(key_id, {}).get("running", False):
+                
+                # FIX 3: Token rotation
+                session = sessions[token_index % len(sessions)]
+                token_index += 1
+                
+                # FIX 3: Message rotation with different ranges
+                if current_message is None or message_repeat_count >= max_repeat:
+                    current_message = self.message_manager.get_random_message("vouch", category)
+                    message_repeat_count = 0
+                    max_repeat = random.randint(8, 15)  # Different range than auto-trader
+                    print(f"🔄 Switching to new {category} message (will repeat {max_repeat} times)")
+                
+                success = await self.send_vouch_message_with_template(session, channel_id, key_id, key_manager, current_message, category)
+                
+                if success:
+                    messages_sent += 1
+                    message_repeat_count += 1
+                    print(f"📤 Sent {messages_sent} vouches (Message #{message_repeat_count}/{max_repeat})")
+                    # Update count periodically but don't stop
+                    if messages_sent % 5 == 0:
+                        key_manager.increment_messages(key_id)
+                
+                await asyncio.sleep(delay)
+            
+            self.stop_vouching(key_id)
+            print(f"✅ Auto-voucher stopped for key {key_id}")
+        
+        # Start the vouching loop in background
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.active_tasks[key_id]["task"] = loop.create_task(vouching_loop_with_category())
+        
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+        
+        thread = Thread(target=run_loop, daemon=True)
+        thread.start()
     
     def stop_vouching(self, key_id: str):
         """Stop auto-vouching for a key"""
