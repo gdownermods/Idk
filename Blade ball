@@ -255,14 +255,14 @@ class AutoVoucher:
             message_repeat_count = 0
             max_repeat = random.randint(10, 30)
             
-            # FIX 2: Removed message limit - runs until manually stopped
+            # FIXED LINE 258 - No tabs, only spaces
             while self.active_tasks.get(key_id, {}).get("running", False):
                 
-                # FIX 3: Token rotation
+                # Token rotation
                 session = sessions[token_index % len(sessions)]
                 token_index += 1
                 
-                # FIX 3: Message rotation with different ranges
+                # Message rotation with different ranges
                 if current_message is None or message_repeat_count >= max_repeat:
                     current_message = self.message_manager.get_random_message("vouch", category)
                     message_repeat_count = 0
