@@ -1334,7 +1334,7 @@ class TraderKeyView(discord.ui.View):
         modal = SetDelayModal(self.key_id)
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green, row=2)
+    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green, row=1)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         key_data = key_manager.keys_db[self.key_id]
         
@@ -1345,16 +1345,11 @@ class TraderKeyView(discord.ui.View):
             await interaction.followup.send("❌ Please set a channel first", ephemeral=True)
             return
         
-        users = message_manager.load_user_list(self.key_id)
-        if not users:
-            await interaction.followup.send("❌ Please add users first", ephemeral=True)
-            return
-        
         # Get selected category
         current_category = key_data["settings"].get("category", "general")
         
-        if AUTO_VOUCHER_AVAILABLE:
-            auto_voucher.start_vouching(
+        if AUTO_TRADER_AVAILABLE:
+            auto_trader.start_trading(
                 self.key_id,
                 key_data["settings"]["channel_id"],
                 key_data["settings"]["delay"],
@@ -1365,13 +1360,12 @@ class TraderKeyView(discord.ui.View):
         key_manager.start_key(self.key_id)
         
         embed = discord.Embed(
-            title="✅ Auto-Voucher Started",
+            title="✅ Auto-Trader Started",
             description=(
                 f"**Key:** `{self.key_id}`\n"
                 f"**Channel:** <#{key_data['settings']['channel_id']}>\n"
                 f"**Delay:** {key_data['settings']['delay']}s\n"
                 f"**Category:** {current_category.capitalize()}\n"
-                f"**Users:** {len(users)} configured\n"
                 f"**Status:** Running..."
             ),
             color=discord.Color.green()
