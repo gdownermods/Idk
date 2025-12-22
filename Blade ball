@@ -255,27 +255,21 @@ class AutoVoucher:
             message_repeat_count = 0
             max_repeat = random.randint(10, 30)
             
-            # FIXED LINE 258 - No tabs, only spaces
             while self.active_tasks.get(key_id, {}).get("running", False):
                 
-                # Token rotation
+                # FIXED: Token rotation - each token gets different message
                 session = sessions[token_index % len(sessions)]
                 token_index += 1
                 
-                # Message rotation with different ranges
-                if current_message is None or message_repeat_count >= max_repeat:
-                    current_message = self.message_manager.get_random_message("vouch", category)
-                    message_repeat_count = 0
-                    max_repeat = random.randint(8, 15)  # Different range than auto-trader
-                    print(f"🔄 Switching to new {category} message (will repeat {max_repeat} times)")
+                # Get NEW message for each token
+                current_message = self.message_manager.get_random_message("vouch", category)
+                print(f"🔄 Token {token_index % len(sessions)} using new {category} message")
                 
                 success = await self.send_vouch_message_with_template(session, channel_id, key_id, key_manager, current_message, category)
                 
                 if success:
                     messages_sent += 1
-                    message_repeat_count += 1
-                    print(f"📤 Sent {messages_sent} vouches (Message #{message_repeat_count}/{max_repeat})")
-                    # Update count periodically but don't stop
+                    print(f"📤 Sent {messages_sent} vouches (Token #{token_index % len(sessions)})")
                     if messages_sent % 5 == 0:
                         key_manager.increment_messages(key_id)
                 
