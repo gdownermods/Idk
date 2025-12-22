@@ -1463,52 +1463,46 @@ class VoucherKeyView(discord.ui.View):
         modal = RemoveUsersModal(self.key_id)
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green, row=2)
+    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green, row=1)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        key_data = key_manager.keys_db[self.key_id]
-        
-        # FIX: Defer and then edit original response
-        await interaction.response.defer(ephemeral=True)
-        
-        if not key_data["settings"]["channel_id"]:
-            await interaction.followup.send("❌ Please set a channel first", ephemeral=True)
-            return
-        
-        users = message_manager.load_user_list(self.key_id)
-        if not users:
-            await interaction.followup.send("❌ Please add users first", ephemeral=True)
-            return
-        
-        # Get selected category
-        current_category = key_data["settings"].get("category", "general")
-        
-        if AUTO_VOUCHER_AVAILABLE:
-            auto_voucher.start_vouching(
-                self.key_id,
-                key_data["settings"]["channel_id"],
-                key_data["settings"]["delay"],
-                key_manager,
-                current_category
-            )
-        
-        key_manager.start_key(self.key_id)
-        
-        embed = discord.Embed(
-            title="✅ Auto-Voucher Started",
-            description=(
-                f"**Key:** `{self.key_id}`\n"
-                f"**Channel:** <#{key_data['settings']['channel_id']}>\n"
-                f"**Delay:** {key_data['settings']['delay']}s\n"
-                f"**Category:** {current_category.capitalize()}\n"
-                f"**Users:** {len(users)} configured\n"
-                f"**Status:** Running..."
-            ),
-            color=discord.Color.green()
-        )
-        
-        # FIX: Edit original response instead of edit_message
-        await interaction.edit_original_response(embed=embed, view=self)
-
+		    key_data = key_manager.keys_db[self.key_id]
+		    
+		    # FIX: Defer and then edit original response
+		    await interaction.response.defer(ephemeral=True)
+		    
+		    if not key_data["settings"]["channel_id"]:
+		        await interaction.followup.send("❌ Please set a channel first", ephemeral=True)
+		        return
+		    
+		    # Get selected category
+		    current_category = key_data["settings"].get("category", "general")
+		    
+		    if AUTO_TRADER_AVAILABLE:
+		        auto_trader.start_trading(
+		            self.key_id,
+		            key_data["settings"]["channel_id"],
+		            key_data["settings"]["delay"],
+		            key_manager,
+		            current_category
+		        )
+		    
+		    key_manager.start_key(self.key_id)
+		    
+		    embed = discord.Embed(
+		        title="✅ Auto-Trader Started",
+		        description=(
+		            f"**Key:** `{self.key_id}`\n"
+		            f"**Channel:** <#{key_data['settings']['channel_id']}>\n"
+		            f"**Delay:** {key_data['settings']['delay']}s\n"
+		            f"**Category:** {current_category.capitalize()}\n"
+		            f"**Status:** Running..."
+		        ),
+		        color=discord.Color.green()
+		    )
+		    
+		    # FIX: Edit original response instead of edit_message
+		    await interaction.edit_original_response(embed=embed, view=self)
+		    
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red)
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         if AUTO_VOUCHER_AVAILABLE:
