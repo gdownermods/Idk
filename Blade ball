@@ -1373,6 +1373,7 @@ class TraderKeyView(discord.ui.View):
 		    
 		    # FIX: Edit original response instead of edit_message
 		    await interaction.edit_original_response(embed=embed, view=self)
+
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red)
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         if AUTO_TRADER_AVAILABLE:
