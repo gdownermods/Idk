@@ -1335,7 +1335,7 @@ class TraderKeyView(discord.ui.View):
         await interaction.response.send_modal(modal)
     
     @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.green, row=1)
-		async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
 		    key_data = key_manager.keys_db[self.key_id]
 		    
 		    # FIX: Defer and then edit original response
