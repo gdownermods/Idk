@@ -1375,28 +1375,29 @@ class TraderKeyView(discord.ui.View):
         await interaction.edit_original_response(embed=embed, view=self)
 
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red, row=1)
-		async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
-		    # Update key status FIRST
-		    key_manager.stop_key(self.key_id)
-		    
-		    if AUTO_TRADER_AVAILABLE:
-		        auto_trader.stop_trading(self.key_id)
-		    
-		    # Get UPDATED key data after stopping
-		    key_data = key_manager.keys_db[self.key_id]
-		    
-		    embed = discord.Embed(
-		        title="⏹️ Auto-Trader Stopped",
-		        description=(
-		            f"**Key:** `{self.key_id}`\n"
-		            f"**Status:** {key_data['settings']['status']}\n"
-		            f"**Messages Sent:** {key_data['settings']['messages_sent']}"
-		        ),
-		        color=discord.Color.orange()
-		    )
-		    
-		    # IMPORTANT: Don't recreate the view, keep using self
-		    await interaction.response.edit_message(embed=embed, view=self)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Update key status FIRST
+        key_manager.stop_key(self.key_id)
+        
+        if AUTO_TRADER_AVAILABLE:
+            auto_trader.stop_trading(self.key_id)
+        
+        # Get UPDATED key data after stopping
+        key_data = key_manager.keys_db[self.key_id]
+        
+        embed = discord.Embed(
+            title="⏹️ Auto-Trader Stopped",
+            description=(
+                f"**Key:** `{self.key_id}`\n"
+                f"**Status:** {key_data['settings']['status']}\n"
+                f"**Messages Sent:** {key_data['settings']['messages_sent']}"
+            ),
+            color=discord.Color.orange()
+        )
+        
+        # IMPORTANT: Don't recreate the view, keep using self
+        await interaction.response.edit_message(embed=embed, view=self)
+    
 class VoucherKeyView(discord.ui.View):
     def __init__(self, key_id):
         super().__init__(timeout=300)
@@ -1505,19 +1506,28 @@ class VoucherKeyView(discord.ui.View):
 		    # FIX: Edit original response instead of edit_message
 		    await interaction.edit_original_response(embed=embed, view=self)
 		    
-    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red)
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.red, row=2)
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Update key status FIRST
+        key_manager.stop_key(self.key_id)
+        
         if AUTO_VOUCHER_AVAILABLE:
             auto_voucher.stop_vouching(self.key_id)
         
-        key_manager.stop_key(self.key_id)
+        # Get UPDATED key data after stopping
+        key_data = key_manager.keys_db[self.key_id]
         
         embed = discord.Embed(
             title="⏹️ Auto-Voucher Stopped",
-            description=f"**Key:** `{self.key_id}`\n**Status:** Stopped",
+            description=(
+                f"**Key:** `{self.key_id}`\n"
+                f"**Status:** {key_data['settings']['status']}\n"
+                f"**Messages Sent:** {key_data['settings']['messages_sent']}"
+            ),
             color=discord.Color.orange()
         )
         
+        # IMPORTANT: Don't recreate the view, keep using self
         await interaction.response.edit_message(embed=embed, view=self)
 
 class VCKeyView(discord.ui.View):
