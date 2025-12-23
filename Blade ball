@@ -1,193 +1,193 @@
-import asyncio
 import random
 import time
-import aiohttp
+import json
+import os
 from typing import List, Dict
-from threading import Thread
-from message_manager import MessageManager
-from auth_system import Authorize, GuildJoiner
-import requests
+from datetime import datetime
 
-class AutoTrader:
-    def __init__(self, config: Dict):
-        self.config = config
-        self.message_manager = MessageManager()
-        self.running = False
-        self.active_tasks = {}
+class MessageManager:
+    def __init__(self):
+        self.base_path = "messages"
+        self.user_lists_file = "vouch_users.json"  # Store user lists per key
+        self.message_history = {}  # Track recent messages to avoid repeats
         
-    def load_tokens(self) -> List[str]:
-        """Load trader tokens from file"""
+        # Create default message directories if they don't exist
+        self.create_default_directories()
+    
+    def create_default_directories(self):
+        """Create default message directories if they don't exist"""
+        directories = [
+            "trade/general",
+            "trade/sab", 
+            "trade/adoptme",
+            "trade/mix",
+            "vouch/general",
+            "vouch/sab",
+            "vouch/adoptme",
+            "vouch/mix"
+        ]
+        
+        for directory in directories:
+            os.makedirs(os.path.join(self.base_path, directory), exist_ok=True)
+            
+            # Create sample message files if empty
+            file_path = os.path.join(self.base_path, directory, "messages.txt")
+            if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+                self.create_sample_messages(directory)
+    
+    def create_sample_messages(self, directory: str):
+        """Create sample messages for a directory"""
+        category, subcategory = directory.split("/")
+        
+        if category == "trade":
+            if subcategory == "sab":
+                messages = ["Trading SAB items!", "WTT SAB gears", "SAB trading available"]
+            elif subcategory == "adoptme":
+                messages = ["Adopt Me trading", "Trading Adopt Me pets", "WTT Adopt Me items"]
+            elif subcategory == "mix":
+                messages = ["Mixed trading available", "Various items for trade", "Trading multiple games"]
+            else:  # general
+                messages = ["WTS OSRS Gold", "WTB RS3 GP", "Trading now!"]
+        else:  # vouch
+            if subcategory == "sab":
+                messages = ["Vouch for {user}! Great SAB trader", "{user} trusted for SAB trades"]
+            elif subcategory == "adoptme":
+                messages = ["Vouch for {user}! Legit Adopt Me trader", "{user} trusted for Adopt Me"]
+            elif subcategory == "mix":
+                messages = ["Vouch for {user}! Various trades", "{user} trusted for multiple games"]
+            else:  # general
+                messages = ["Vouch for {user}! Smooth trade", "{user} is trusted"]
+        
+        file_path = os.path.join(self.base_path, directory, "messages.txt")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for msg in messages:
+                f.write(msg + "\n")
+    
+    def get_random_message(self, category: str, subcategory: str = "general"):
+        """Get random message from specified category and subcategory"""
         try:
-            with open('tokens_trade.txt', 'r') as f:
-                return [line.strip() for line in f if line.strip()]
+            # Build the file path
+            file_path = os.path.join(self.base_path, category, subcategory, "messages.txt")
+            
+            # If subcategory doesn't exist, fallback to general
+            if not os.path.exists(file_path):
+                file_path = os.path.join(self.base_path, category, "general", "messages.txt")
+            
+            # If still doesn't exist, create it
+            if not os.path.exists(file_path):
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                self.create_sample_messages(f"{category}/{subcategory}")
+            
+            # Load messages
+            with open(file_path, 'r', encoding='utf-8') as f:
+                messages = [line.strip() for line in f if line.strip()]
+            
+            if not messages:
+                # Create default message
+                default_msg = f"Default {subcategory} {category} message"
+                messages = [default_msg]
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(default_msg + "\n")
+            
+            # Filter out recently used messages (last 5)
+            key = f"{category}_{subcategory}"
+            recent = self.message_history.get(key, [])
+            available = [msg for msg in messages if msg not in recent[-5:]]
+            
+            # If all messages recently used, use any
+            if not available:
+                available = messages
+            
+            # Select random message
+            selected = random.choice(available)
+            
+            # Update history
+            if key not in self.message_history:
+                self.message_history[key] = []
+            
+            self.message_history[key].append(selected)
+            if len(self.message_history[key]) > 10:
+                self.message_history[key].pop(0)
+            
+            return selected
+                
+        except Exception as e:
+            print(f"❌ Error loading messages from {category}/{subcategory}: {e}")
+            return f"Default {subcategory} {category} message"
+    
+    def get_available_categories(self, main_category: str):
+        """Get available subcategories for a main category"""
+        categories_path = os.path.join(self.base_path, main_category)
+        if not os.path.exists(categories_path):
+            return ["general"]
+        
+        categories = ["general"]  # Always include general
+        for item in os.listdir(categories_path):
+            item_path = os.path.join(categories_path, item)
+            if os.path.isdir(item_path):
+                categories.append(item)
+        
+        return list(set(categories))
+    
+    # KEEP ALL YOUR EXISTING USER MANAGEMENT METHODS:
+    def load_user_list(self, key_id: str) -> List[str]:
+        """Load user list for a specific key"""
+        try:
+            with open(self.user_lists_file, 'r') as f:
+                data = json.load(f)
+                return data.get(key_id, [])
         except FileNotFoundError:
             return []
     
-    def get_token_session(self, token_line: str):
-        """Create authenticated session for token with shared proxy"""
+    def save_user_list(self, key_id: str, users: List[str]):
+        """Save user list for a specific key"""
         try:
-            # Extract token
-            if ':' in token_line:
-                parts = token_line.split(':')
-                if len(parts) >= 3:
-                    token = parts[2].strip()
-                else:
-                    token = token_line.strip()
-            else:
-                token = token_line.strip()
-            
-            # Create authorized session WITH PROXY
-            auth = Authorize(
-                self.config["client_id"],
-                self.config["redirect_uri"],
-                self.config["client_secret"],
-                token_line  # Pass the full token line for proxy assignment
-            )
-            
-            result = auth.authorize()
-            if not result:
-                return None
-            
-            user_id, access_token, refresh_token, discord_token = result
-            
-            # Create session (proxy is already handled by the auth system)
-            session = requests.Session()
-            
-            return {
-                "token": discord_token,
-                "access_token": access_token,
-                "user_id": user_id,
-                "session": session
-            }
-            
-        except Exception as e:
-            print(f"❌ Failed to auth token: {e}")
-            return None
+            with open(self.user_lists_file, 'r') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = {}
+        
+        data[key_id] = users
+        
+        with open(self.user_lists_file, 'w') as f:
+            json.dump(data, f, indent=2)
     
-    async def send_trade_message_with_template(self, session_data: Dict, channel_id: str, key_id: str, key_manager, message: str):
-        """Send a trade message using a specific message"""
+    def add_users_to_list(self, key_id: str, users: List[str]):
+        """Add users to existing list"""
+        current = self.load_user_list(key_id)
+        new_users = [u.strip() for u in users if u.strip() and u.strip() not in current]
+        updated = current + new_users
+        self.save_user_list(key_id, updated)
+    
+    def remove_users_from_list(self, key_id: str, users: List[str]):
+        """Remove users from list"""
+        current = self.load_user_list(key_id)
+        users_to_remove = [u.strip() for u in users if u.strip()]
+        updated = [u for u in current if u not in users_to_remove]
+        self.save_user_list(key_id, updated)
+    
+    def get_next_user(self, key_id: str) -> str:
+        """Get next user to vouch (round-robin)"""
+        users = self.load_user_list(key_id)
+        if not users:
+            return "@user"  # Default placeholder
+        
+        # Get rotation state
+        rotation_file = "user_rotation.json"
         try:
-            headers = {
-                "Authorization": session_data["token"],
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "content": message,
-                "tts": False
-            }
-            
-            url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-            
-            async with aiohttp.ClientSession() as http_session:
-                async with http_session.post(url, json=payload, headers=headers) as response:
-                    if response.status in (200, 201, 204):
-                        print(f"✅ Trade message sent to channel {channel_id}")
-                        key_manager.increment_messages(key_id)
-                        return True
-                    else:
-                        print(f"❌ Failed to send trade message: {response.status}")
-                        return False
-                            
-        except Exception as e:
-            print(f"❌ Error sending trade message: {e}")
-            return False
-    
-    def start_trading(self, key_id: str, channel_id: str, delay: int, key_manager, category: str = "general"):
-        """Start auto-trading for a key with specified category"""
-        if key_id in self.active_tasks:
-            print(f"⚠️ Trading already running for key {key_id}")
-            return
+            with open(rotation_file, 'r') as f:
+                rotation = json.load(f)
+        except FileNotFoundError:
+            rotation = {}
         
-        # Update category setting
-        key_manager.update_settings(key_id, {"category": category})
+        current_index = rotation.get(key_id, 0)
         
-        # Get how many tokens this key should use
-        key_data = key_manager.keys_db.get(key_id, {})
-        max_tokens = key_data.get("tokens", 0)
+        # Get user
+        user = users[current_index % len(users)]
         
-        self.running = True
-        self.active_tasks[key_id] = {
-            "running": True,
-            "task": None,
-            "current_message": None,
-            "message_count": 0,
-            "max_message_repeat": random.randint(10, 30),
-            "category": category
-        }
+        # Update index for next time
+        rotation[key_id] = current_index + 1
+        with open(rotation_file, 'w') as f:
+            json.dump(rotation, f, indent=2)
         
-        async def trading_loop_with_category():
-            tokens = self.load_tokens()
-            if not tokens:
-                print("❌ No trader tokens available")
-                return
-            
-            usable_tokens = tokens[:max_tokens]
-            print(f"✅ Using {len(usable_tokens)}/{max_tokens} tokens for key {key_id} with category: {category}")
-            
-            if not usable_tokens:
-                print("❌ No usable tokens")
-                return
-            
-            # Authorize only the tokens we'll use
-            sessions = []
-            for token_line in usable_tokens:
-                session = self.get_token_session(token_line)
-                if session:
-                    sessions.append(session)
-            
-            if not sessions:
-                print("❌ No valid trader tokens")
-                return
-            
-            print(f"✅ Starting auto-trader with {len(sessions)} tokens, category: {category}")
-            
-            token_index = 0
-            messages_sent = 0
-            
-            # Run continuously until manually stopped
-            while self.active_tasks.get(key_id, {}).get("running", False):
-                
-                # FIXED: Token rotation - each token gets different message
-                session = sessions[token_index % len(sessions)]
-                token_index += 1
-                
-                # Get NEW message for each token
-                current_message = self.message_manager.get_random_message("trade", category)
-                print(f"🔄 Token {token_index % len(sessions)} using new {category} message")
-                
-                success = await self.send_trade_message_with_template(session, channel_id, key_id, key_manager, current_message)
-                
-                if success:
-                    messages_sent += 1
-                    print(f"📤 Sent {messages_sent} trades (Token #{token_index % len(sessions)})")
-                    # Update message count periodically (every 10 messages)
-                    if messages_sent % 10 == 0:
-                        key_manager.increment_messages(key_id)
-                
-                await asyncio.sleep(delay)
-            
-            self.stop_trading(key_id)
-            print(f"✅ Auto-trader stopped for key {key_id}")
-        
-        # Start the trading loop in background
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self.active_tasks[key_id]["task"] = loop.create_task(trading_loop_with_category())
-        
-        def run_loop():
-            asyncio.set_event_loop(loop)
-            loop.run_forever()
-        
-        thread = Thread(target=run_loop, daemon=True)
-        thread.start()
-    
-    def stop_trading(self, key_id: str):
-        """Stop auto-trading for a key"""
-        if key_id in self.active_tasks:
-            self.active_tasks[key_id]["running"] = False
-            task = self.active_tasks[key_id]["task"]
-            if task:
-                task.cancel()
-            del self.active_tasks[key_id]
-            print(f"⏹️ Stopped auto-trader for key {key_id}")
+        return user
